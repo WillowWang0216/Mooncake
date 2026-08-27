@@ -1,5 +1,7 @@
 file(GLOB UB_SOURCES "*.cpp" "urma/urma_endpoint.cpp" "ub_allocator.cpp")
 
+include(CheckCXXSourceCompiles)
+
 # Check if liburma.so exists
 find_library(URMA_LIBRARY urma PATHS /usr/lib64)
 
@@ -26,6 +28,22 @@ target_include_directories(ub_transport
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../mooncake-integration/store
 )
+set(_UB_SAVED_CMAKE_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES})
+set(CMAKE_REQUIRED_INCLUDES ${urma_INCLUDE_DIR})
+check_cxx_source_compiles("
+#include <urma_api.h>
+int main() {
+    urma_seg_cfg_t cfg = {};
+    cfg.is_gpu_seg = 1;
+    return 0;
+}
+" HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+set(CMAKE_REQUIRED_INCLUDES ${_UB_SAVED_CMAKE_REQUIRED_INCLUDES})
+unset(_UB_SAVED_CMAKE_REQUIRED_INCLUDES)
+if(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+    target_compile_definitions(ub_transport
+            PRIVATE HAVE_URMA_SEG_CFG_IS_GPU_SEG=1)
+endif()
 target_link_libraries(ub_transport
         PRIVATE
         JsonCpp::JsonCpp

@@ -37,6 +37,8 @@ class UbWorkerpool;
 
 enum UB_ENDPOINT_TYPE { URMA_ENDPOINT = 0, OBMM_ENDPOINT = 1 };
 
+enum class UbMemoryRegionType { kHost, kGpuGdr };
+
 // ub transport supports integration of endpoints that use UB protocol software.
 // Currently, two types of endpoints are supported: urma and obmm.
 // urma link : https://atomgit.com/openeuler/umdk
@@ -117,7 +119,12 @@ class UbTransport : public Transport {
     };
 
     bool stagingEnabled() const;
+    enum class GpuMode { kHost, kStaging, kGdr };
+
+    GpuMode gpuMode() const;
+    const char* gpuModeName() const;
     bool isDevicePointer(const void* ptr) const;
+    int prepareGdrDeviceMemory(void* addr, size_t length) const;
     bool isLogicalDeviceRange(const void* ptr, size_t length) const;
     int registerLogicalDeviceRegion(void* addr, size_t length,
                                     const std::string& location,
@@ -178,7 +185,7 @@ class UbTransport : public Transport {
     bool runtime_initialized_ = false;
 
     mutable std::once_flag staging_config_once_;
-    mutable bool staging_enabled_ = false;
+    mutable GpuMode gpu_mode_ = GpuMode::kStaging;
     mutable std::mutex device_region_mutex_;
     std::vector<DeviceRegion> device_regions_;
     std::mutex staging_pool_mutex_;

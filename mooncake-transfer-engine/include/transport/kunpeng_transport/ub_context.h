@@ -182,7 +182,9 @@ class UbContext {
     virtual int deconstruct() = 0;
 
    public:
-    virtual int registerMemoryRegion(uint64_t va, size_t length) = 0;
+    virtual int registerMemoryRegion(
+        uint64_t va, size_t length,
+        UbMemoryRegionType type = UbMemoryRegionType::kHost) = 0;
 
     virtual int unregisterMemoryRegion(uint64_t va) = 0;
 

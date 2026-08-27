@@ -21,7 +21,9 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <optional>
 
+#include "cuda_alike.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #include "common.h"
@@ -46,6 +48,26 @@ DEFINE_string(nic_priority_matrix, "",
               "Path to UB NIC priority matrix file (Advanced)");
 
 DEFINE_string(segment_id, "127.0.0.1", "Segment ID to access data");
+
+class EnvGuard {
+   public:
+    explicit EnvGuard(const char* name) : name_(name) {
+        const char* value = std::getenv(name_);
+        if (value) old_value_ = value;
+    }
+
+    ~EnvGuard() {
+        if (old_value_) {
+            ::setenv(name_, old_value_->c_str(), 1);
+        } else {
+            ::unsetenv(name_);
+        }
+    }
+
+   private:
+    const char* name_;
+    std::optional<std::string> old_value_;
+};
 
 std::string formatDeviceNames(const std::string &device_names) {
     std::stringstream ss(device_names);
@@ -95,6 +117,80 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 }
 
 static void freeMemoryPool(void *addr, size_t size) { numa_free(addr, size); }
+
+static bool hasKernelModule(const char* module_name) {
+    std::ifstream modules("/proc/modules");
+    std::string name;
+    while (modules >> name) {
+        if (name == module_name) {
+            return true;
+        }
+        std::string rest;
+        std::getline(modules, rest);
+    }
+    return false;
+}
+
+TEST(UBTransportGpuModeTest, GdrRejectsHostBuffer) {
+    EnvGuard gpu_mode_guard("MC_UB_GPU_MODE");
+    ASSERT_EQ(::setenv("MC_UB_GPU_MODE", "gdr", 1), 0);
+
+    auto engine = std::make_unique<TransferEngine>(false);
+    static int offset = 1000;
+    auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
+                 hostname_port.first.c_str(), hostname_port.second + offset++);
+
+    std::string nic_priority_matrix = loadNicPriorityMatrix();
+    void *args[2] = {const_cast<char *>(nic_priority_matrix.c_str()), nullptr};
+    auto *xport = engine->installTransport("ub", args);
+    ASSERT_NE(xport, nullptr);
+
+    const size_t ram_buffer_size = 4096;
+    void *addr = allocateMemoryPool(ram_buffer_size, 0, false);
+    ASSERT_NE(addr, nullptr);
+
+    int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
+    EXPECT_NE(rc, 0);
+
+    freeMemoryPool(addr, ram_buffer_size);
+}
+
+#if defined(USE_CUDA)
+TEST(UBTransportGpuModeTest, GdrRegistersDeviceBuffer) {
+    EnvGuard gpu_mode_guard("MC_UB_GPU_MODE");
+    ASSERT_EQ(::setenv("MC_UB_GPU_MODE", "gdr", 1), 0);
+
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count == 0) {
+        GTEST_SKIP() << "CUDA device unavailable";
+    }
+    if (!hasKernelModule("nvidia_peermem")) {
+        GTEST_SKIP() << "nvidia_peermem kernel module unavailable";
+    }
+
+    auto engine = std::make_unique<TransferEngine>(false);
+    static int offset = 2000;
+    auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
+    engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
+                 hostname_port.first.c_str(), hostname_port.second + offset++);
+
+    std::string nic_priority_matrix = loadNicPriorityMatrix();
+    void *args[2] = {const_cast<char *>(nic_priority_matrix.c_str()), nullptr};
+    auto *xport = engine->installTransport("ub", args);
+    ASSERT_NE(xport, nullptr);
+
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    void* dev_addr = nullptr;
+    ASSERT_EQ(cudaMalloc(&dev_addr, 4096), cudaSuccess);
+
+    int rc = engine->registerLocalMemory(dev_addr, 4096, "cuda:0");
+    EXPECT_EQ(rc, 0);
+    EXPECT_EQ(engine->unregisterLocalMemory(dev_addr), 0);
+    ASSERT_EQ(cudaFree(dev_addr), cudaSuccess);
+}
+#endif
 
 class UBTransportTest : public ::testing::Test {
    public:

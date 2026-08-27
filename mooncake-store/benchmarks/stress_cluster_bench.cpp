@@ -2,6 +2,8 @@
 #include <sched.h>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cstdint>
 #include <chrono>
 #include <limits>
 #include <cmath>
@@ -21,8 +23,10 @@
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
+#include "cuda_alike.h"
 #include "mooncake_logging.h"
 #include "real_client.h"
+#include "ub_allocator.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -204,6 +208,13 @@ DEFINE_uint64(client_init_wait_seconds, 0,
               "Seconds to wait after RealClient setup succeeds and before "
               "benchmark run starts. This can give asynchronous RPC/transfer "
               "warmup and background initialization time to settle.");
+DEFINE_string(ub_gpu_mode, "",
+              "UB GPU mode override: host|staging|gdr. Empty keeps env.");
+DEFINE_string(ub_buffer_mode, "",
+              "UB buffer mode: auto|host|gpu. Empty keeps env/default auto.");
+DEFINE_uint64(key_size, 0,
+              "Fixed key size in bytes for write/read scenarios. 0 keeps "
+              "legacy variable-length keys.");
 DEFINE_bool(verify, true, "Verify data integrity after read");
 DEFINE_uint64(replica_num, 1, "Number of replicas for each object");
 DEFINE_bool(hard_pin, false,
@@ -229,6 +240,191 @@ DEFINE_uint64(shuffle_seed, 0,
 
 using Clock = std::chrono::steady_clock;
 using Nanos = std::chrono::nanoseconds;
+
+enum class UbGpuMode { kHost, kStaging, kGdr };
+enum class UbBufferMode { kAuto, kHost, kGpu };
+
+#if defined(USE_CUDA)
+static void checkCudaError(cudaError_t result, const char* message) {
+    if (result != cudaSuccess) {
+        LOG(ERROR) << message << ": " << cudaGetErrorString(result);
+        std::exit(EXIT_FAILURE);
+    }
+}
+#endif
+
+static std::string ToLower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return value;
+}
+
+static std::string ReadOverrideOrEnv(const std::string& override_value,
+                                     const char* env_name,
+                                     const std::string& default_value) {
+    if (!override_value.empty()) return override_value;
+    const char* env_value = std::getenv(env_name);
+    if (env_value && *env_value) return env_value;
+    return default_value;
+}
+
+static UbGpuMode ParseGpuMode(const std::string& mode) {
+    const std::string lower = ToLower(mode);
+    if (lower == "host") return UbGpuMode::kHost;
+    if (lower == "staging" || lower == "cpu_staging" ||
+        lower == "cpustaging") {
+        return UbGpuMode::kStaging;
+    }
+    if (lower == "gdr") return UbGpuMode::kGdr;
+    LOG(ERROR) << "Unknown UB GPU mode: " << mode;
+    std::exit(EXIT_FAILURE);
+}
+
+static UbBufferMode ParseBufferMode(const std::string& mode) {
+    const std::string lower = ToLower(mode);
+    if (lower == "auto") return UbBufferMode::kAuto;
+    if (lower == "host") return UbBufferMode::kHost;
+    if (lower == "gpu") return UbBufferMode::kGpu;
+    LOG(ERROR) << "Unknown UB buffer mode: " << mode;
+    std::exit(EXIT_FAILURE);
+}
+
+static const char* UbGpuModeName(UbGpuMode mode) {
+    switch (mode) {
+        case UbGpuMode::kHost:
+            return "host";
+        case UbGpuMode::kStaging:
+            return "staging";
+        case UbGpuMode::kGdr:
+            return "gdr";
+    }
+    return "unknown";
+}
+
+static const char* UbBufferModeName(UbBufferMode mode) {
+    switch (mode) {
+        case UbBufferMode::kAuto:
+            return "auto";
+        case UbBufferMode::kHost:
+            return "host";
+        case UbBufferMode::kGpu:
+            return "gpu";
+    }
+    return "unknown";
+}
+
+struct UbBenchRuntimeConfig {
+    UbGpuMode gpu_mode = UbGpuMode::kStaging;
+    UbBufferMode buffer_mode = UbBufferMode::kAuto;
+    bool use_gpu_buffer = false;
+};
+
+static UbBenchRuntimeConfig ResolveUbBenchRuntimeConfig() {
+    UbBenchRuntimeConfig config;
+    if (FLAGS_protocol != "ub") {
+        return config;
+    }
+    const std::string gpu_mode_str = ReadOverrideOrEnv(
+        FLAGS_ub_gpu_mode, "MC_UB_GPU_MODE", "staging");
+    const std::string buffer_mode_str = ReadOverrideOrEnv(
+        FLAGS_ub_buffer_mode, "MC_UB_BUFFER_MODE", "auto");
+    config.gpu_mode = ParseGpuMode(gpu_mode_str);
+    config.buffer_mode = ParseBufferMode(buffer_mode_str);
+    const bool gdr_mode = config.gpu_mode == UbGpuMode::kGdr;
+
+    if (config.buffer_mode == UbBufferMode::kHost && gdr_mode) {
+        LOG(WARNING) << "UB GDR mode requires GPU buffer; ignoring "
+                        "--ub_buffer_mode=host";
+    }
+    if (config.buffer_mode == UbBufferMode::kGpu && !gdr_mode) {
+        LOG(WARNING) << "--ub_buffer_mode=gpu requires --ub_gpu_mode=gdr; "
+                        "using host buffer";
+    }
+    config.use_gpu_buffer = gdr_mode;
+
+    return config;
+}
+
+static void ApplyUbBenchRuntimeConfig() {
+    if (FLAGS_protocol != "ub") return;
+    const UbBenchRuntimeConfig config = ResolveUbBenchRuntimeConfig();
+    ::setenv("MC_UB_GPU_MODE", UbGpuModeName(config.gpu_mode), 1);
+    ::setenv("MC_UB_BUFFER_MODE", UbBufferModeName(config.buffer_mode), 1);
+    LOG(INFO) << "UB benchmark config: gpu_mode="
+              << UbGpuModeName(config.gpu_mode)
+              << ", buffer_mode=" << UbBufferModeName(config.buffer_mode)
+              << ", use_gpu_buffer="
+              << (config.use_gpu_buffer ? "yes" : "no");
+}
+
+static std::string SanitizeSegmentName(std::string segment) {
+    static const char* kSpecialChars = ".:-/\\[]{}()@#$%^&*+=|<>,;!?`'\"~";
+    for (char& c : segment) {
+        if (std::strchr(kSpecialChars, c) != nullptr ||
+            std::isspace(static_cast<unsigned char>(c))) {
+            c = '_';
+        }
+    }
+    return segment;
+}
+
+static std::string BuildFixedKey(const std::string& prefix, size_t idx) {
+    const size_t key_size = static_cast<size_t>(FLAGS_key_size);
+    if (key_size == 0) return prefix + std::to_string(idx);
+
+    std::string key = prefix + std::to_string(idx);
+    if (key.size() > key_size) {
+        LOG(ERROR) << "Requested key_size=" << key_size
+                   << " is smaller than generated key length " << key.size()
+                   << " for key '" << key << "'";
+        std::exit(EXIT_FAILURE);
+    }
+    key.resize(key_size, '_');
+    return key;
+}
+
+static void ValidateKeySize() {
+    if (FLAGS_key_size == 0) return;
+
+    const size_t max_index_digits =
+        std::to_string(std::max<uint64_t>(FLAGS_num_keys, 1) - 1).size();
+    const size_t min_regular_key_size =
+        std::string("bench_key_").size() + max_index_digits;
+    if (FLAGS_key_size < min_regular_key_size) {
+        LOG(ERROR) << "--key_size=" << FLAGS_key_size
+                   << " is too small; needs at least "
+                   << min_regular_key_size << " bytes for bench keys";
+        std::exit(EXIT_FAILURE);
+    }
+
+    if (FLAGS_scenario != "segment_write" &&
+        FLAGS_scenario != "segment_read") {
+        return;
+    }
+    std::vector<std::string> segments;
+    std::istringstream iss(FLAGS_segments);
+    std::string segment;
+    while (std::getline(iss, segment, ',')) {
+        size_t start = segment.find_first_not_of(" \t");
+        size_t end = segment.find_last_not_of(" \t");
+        if (start != std::string::npos && end != std::string::npos) {
+            segments.push_back(segment.substr(start, end - start + 1));
+        }
+    }
+    for (const auto& segment : segments) {
+        std::string sanitized = SanitizeSegmentName(segment);
+        const size_t min_segment_key_size =
+            std::string("seg_").size() + sanitized.size() +
+            std::string("_key_").size() + max_index_digits;
+        if (FLAGS_key_size < min_segment_key_size) {
+            LOG(ERROR) << "--key_size=" << FLAGS_key_size
+                       << " is too small; needs at least "
+                       << min_segment_key_size
+                       << " bytes for segment key prefix";
+            std::exit(EXIT_FAILURE);
+        }
+    }
+}
 
 inline int64_t ElapsedNanos(Clock::time_point t0, Clock::time_point t1) {
     return std::chrono::duration_cast<Nanos>(t1 - t0).count();
@@ -408,7 +604,15 @@ class StressBenchmark {
                     LOG(WARNING)
                         << "Failed to unregister thread buffer, ignoring";
                 }
-                numa_free(tb.ptr, tb.size);
+                if (tb.is_gpu) {
+#if defined(USE_UB)
+                    mooncake::ub_free_memory_gdr(tb.ptr);
+#else
+                    LOG(ERROR) << "Cannot free UB GDR buffer in non-UB build";
+#endif
+                } else {
+                    numa_free(tb.ptr, tb.size);
+                }
                 tb.ptr = nullptr;
             }
         }
@@ -421,13 +625,23 @@ class StressBenchmark {
             } catch (...) {
                 LOG(WARNING) << "Failed to unregister main buffer, ignoring";
             }
-            numa_free(buffer_, buffer_size_);
+            if (buffer_is_gpu_) {
+#if defined(USE_UB)
+                mooncake::ub_free_memory_gdr(buffer_);
+#else
+                LOG(ERROR) << "Cannot free UB GDR buffer in non-UB build";
+#endif
+            } else {
+                numa_free(buffer_, buffer_size_);
+            }
             buffer_ = nullptr;
         }
         client_ = nullptr;
     }
 
     int Setup() {
+        runtime_config_ = ResolveUbBenchRuntimeConfig();
+
         int ret = client_->setup_real(
             FLAGS_local_hostname, FLAGS_metadata_server,
             FLAGS_global_segment_size, FLAGS_local_buffer_size, FLAGS_protocol,
@@ -441,13 +655,33 @@ class StressBenchmark {
                   << (FLAGS_enable_ssd_offload ? " (SSD offload enabled)" : "");
 
         buffer_size_ = FLAGS_batch_size * FLAGS_value_size;
-        buffer_ = reinterpret_cast<char*>(numa_alloc_local(buffer_size_));
-        if (!buffer_) {
-            LOG(ERROR) << "Failed to allocate buffer of " << buffer_size_
-                       << " bytes";
+        if (runtime_config_.use_gpu_buffer) {
+#if defined(USE_CUDA) && defined(USE_UB)
+            // Allocate GPU buffer using UB GDR, 这是GPU VA
+            buffer_ = reinterpret_cast<char*>(
+                mooncake::ub_allocate_memory_gdr(buffer_size_));
+            if (!buffer_) {
+                LOG(ERROR) << "Failed to allocate GPU buffer of "
+                           << buffer_size_ << " bytes";
+                return -1;
+            }
+            buffer_is_gpu_ = true;
+            buffer_shadow_.assign(buffer_size_, 0);
+#else
+            LOG(ERROR) << "UB GDR benchmark mode requires USE_CUDA and USE_UB";
             return -1;
+#endif
+        } else {
+            buffer_ = reinterpret_cast<char*>(numa_alloc_local(buffer_size_));
+            if (!buffer_) {
+                LOG(ERROR) << "Failed to allocate buffer of " << buffer_size_
+                           << " bytes";
+                return -1;
+            }
+            buffer_is_gpu_ = false;
+            buffer_shadow_.clear();
+            std::memset(buffer_, 0, buffer_size_);
         }
-        std::memset(buffer_, 0, buffer_size_);
 
         ret = client_->register_buffer(buffer_, buffer_size_);
         if (ret != 0) {
@@ -709,14 +943,8 @@ class StressBenchmark {
     }
 
     static std::string MakeSegmentKey(const std::string& segment, size_t idx) {
-        static const char* kSpecialChars = ".:-/\\[]{}()@#$%^&*+=|<>,;!?`'\"~";
-        std::string sanitized = segment;
-        for (char& c : sanitized) {
-            if (std::strchr(kSpecialChars, c) != nullptr || std::isspace(c)) {
-                c = '_';
-            }
-        }
-        return "seg_" + sanitized + "_key_" + std::to_string(idx);
+        std::string sanitized = SanitizeSegmentName(segment);
+        return BuildFixedKey("seg_" + sanitized + "_key_", idx);
     }
 
     int RunSegmentWrite() {
@@ -1315,11 +1543,18 @@ class StressBenchmark {
 
    private:
     static std::string MakeKey(size_t idx) {
-        return "bench_key_" + std::to_string(idx);
+        return BuildFixedKey("bench_key_", idx);
     }
 
     void FillBuffer(size_t seed) {
-        uint64_t* ptr = reinterpret_cast<uint64_t*>(buffer_);
+        void* target = buffer_;
+        if (buffer_is_gpu_) {
+            if (buffer_shadow_.size() != buffer_size_) {
+                buffer_shadow_.assign(buffer_size_, 0);
+            }
+            target = buffer_shadow_.data();
+        }
+        uint64_t* ptr = reinterpret_cast<uint64_t*>(target);
         size_t num_words = FLAGS_value_size / sizeof(uint64_t);
         uint64_t pattern = static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ULL;
         for (size_t w = 0; w < num_words; ++w) {
@@ -1327,10 +1562,30 @@ class StressBenchmark {
             pattern = (pattern ^ (pattern >> 27)) * 0x94D049BB133111EBULL;
             ptr[w] = pattern ^ (pattern >> 31);
         }
+#if defined(USE_CUDA)
+        if (buffer_is_gpu_) {
+            checkCudaError(cudaMemcpy(buffer_, buffer_shadow_.data(),
+                                      FLAGS_value_size,
+                                      cudaMemcpyHostToDevice),
+                           "Failed to copy benchmark buffer to GPU");
+        }
+#endif
     }
 
     bool CheckBuffer(size_t seed, const void* data, size_t size) const {
-        const uint64_t* ptr = reinterpret_cast<const uint64_t*>(data);
+        std::vector<uint8_t> shadow;
+        const void* compare_data = data;
+#if defined(USE_CUDA)
+        if (buffer_is_gpu_) {
+            shadow.resize(size);
+            checkCudaError(cudaMemcpy(shadow.data(), data, size,
+                                      cudaMemcpyDeviceToHost),
+                           "Failed to copy benchmark buffer from GPU");
+            compare_data = shadow.data();
+        }
+#endif
+        const uint64_t* ptr =
+            reinterpret_cast<const uint64_t*>(compare_data);
         size_t num_words = size / sizeof(uint64_t);
         uint64_t pattern = static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ULL;
         for (size_t w = 0; w < num_words; ++w) {
@@ -1518,11 +1773,15 @@ class StressBenchmark {
     std::shared_ptr<mooncake::RealClient> client_;
     char* buffer_;
     size_t buffer_size_;
+    bool buffer_is_gpu_ = false;
+    std::vector<uint8_t> buffer_shadow_;
+    UbBenchRuntimeConfig runtime_config_;
 
     struct ThreadBuffer {
         char* ptr = nullptr;
         size_t size = 0;
         int numa_node = -1;
+        bool is_gpu = false;
     };
     std::vector<ThreadBuffer> thread_buffers_;
 
@@ -1533,14 +1792,30 @@ class StressBenchmark {
             int node = t % NR_SOCKETS;
             thread_buffers_[t].size = per_buf_size;
             thread_buffers_[t].numa_node = node;
-            thread_buffers_[t].ptr =
-                reinterpret_cast<char*>(numa_alloc_onnode(per_buf_size, node));
-            if (!thread_buffers_[t].ptr) {
-                LOG(ERROR) << "Failed to allocate buffer for thread " << t
-                           << " on NUMA node " << node;
+            thread_buffers_[t].is_gpu = runtime_config_.use_gpu_buffer;
+            if (runtime_config_.use_gpu_buffer) {
+#if defined(USE_CUDA) && defined(USE_UB)
+                thread_buffers_[t].ptr = reinterpret_cast<char*>(
+                    mooncake::ub_allocate_memory_gdr(per_buf_size));
+                if (!thread_buffers_[t].ptr) {
+                    LOG(ERROR) << "Failed to allocate GPU buffer for thread "
+                               << t << " size=" << per_buf_size;
+                    return -1;
+                }
+#else
+                LOG(ERROR) << "UB GDR benchmark mode requires USE_CUDA and USE_UB";
                 return -1;
+#endif
+            } else {
+                thread_buffers_[t].ptr = reinterpret_cast<char*>(
+                    numa_alloc_onnode(per_buf_size, node));
+                if (!thread_buffers_[t].ptr) {
+                    LOG(ERROR) << "Failed to allocate buffer for thread "
+                               << t << " on NUMA node " << node;
+                    return -1;
+                }
+                std::memset(thread_buffers_[t].ptr, 0, per_buf_size);
             }
-            std::memset(thread_buffers_[t].ptr, 0, per_buf_size);
             int ret =
                 client_->register_buffer(thread_buffers_[t].ptr, per_buf_size);
             if (ret != 0) {
@@ -1566,10 +1841,20 @@ int main(int argc, char* argv[]) {
         FLAGS_logtostderr = true;
     }
     mooncake::logging::ApplyMooncakeLogEnableToGlog();
+    ApplyUbBenchRuntimeConfig();
+    ValidateKeySize();
+    const UbBenchRuntimeConfig runtime_config = ResolveUbBenchRuntimeConfig();
 
     LOG(INFO) << "Mooncake Stress Cluster Benchmark";
     LOG(INFO) << "  Scenario:       " << FLAGS_scenario;
     LOG(INFO) << "  Protocol:       " << FLAGS_protocol;
+    LOG(INFO) << "  UB GPU mode:    "
+              << UbGpuModeName(runtime_config.gpu_mode);
+    LOG(INFO) << "  UB buffer mode:  "
+              << UbBufferModeName(runtime_config.buffer_mode);
+    LOG(INFO) << "  UB GPU buffer:   "
+              << (runtime_config.use_gpu_buffer ? "yes" : "no");
+    LOG(INFO) << "  Key size:       " << FLAGS_key_size;
     LOG(INFO) << "  Value size:     " << FLAGS_value_size / MB << " MB";
     LOG(INFO) << "  Num keys:       " << FLAGS_num_keys;
     LOG(INFO) << "  Batch size:     " << FLAGS_batch_size;
@@ -1598,7 +1883,7 @@ int main(int argc, char* argv[]) {
                      << "decreasing --num_keys, or use --hard_pin=true.";
     }
 
-    StressBenchmark bench;
+    StressBenchmark bench;//构造
     int ret = bench.Setup();
     if (ret != 0) {
         LOG(ERROR) << "Benchmark setup failed";

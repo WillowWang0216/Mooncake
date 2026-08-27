@@ -27,6 +27,7 @@
 
 #include "common.h"
 #include "common/base/status.h"
+#include "ub_allocator.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -90,7 +91,7 @@ DEFINE_string(operation, "read", "Operation type: read or write");
 
 DEFINE_string(protocol, "rdma",
               "Transfer protocol: "
-              "rdma|barex|tcp|efa|nvlink|nvlink_intra|hip|sunrise_link");
+              "rdma|barex|tcp|efa|ub|nvlink|nvlink_intra|hip|sunrise_link");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -119,12 +120,96 @@ DEFINE_int32(gpu_id, 0,
 
 using namespace mooncake;
 
+static bool ubShouldUseVramBuffer() {
+#if defined(USE_CUDA)
+    const char* gpu_mode_env = std::getenv("MC_UB_GPU_MODE");
+    const std::string gpu_mode = gpu_mode_env ? gpu_mode_env : "";
+    const bool gdr_mode = gpu_mode == "gdr";
+
+    const char* buffer_mode_env = std::getenv("MC_UB_BUFFER_MODE");
+    std::string buffer_mode = buffer_mode_env ? buffer_mode_env : "auto";
+    if (buffer_mode == "host") {
+        if (gdr_mode) {
+            LOG(WARNING)
+                << "MC_UB_GPU_MODE=gdr requires GPU buffer; ignoring "
+                   "MC_UB_BUFFER_MODE=host";
+        }
+        return gdr_mode;
+    }
+    if (buffer_mode == "gpu") {
+        if (!gdr_mode) {
+            LOG(WARNING)
+                << "MC_UB_BUFFER_MODE=gpu requires MC_UB_GPU_MODE=gdr; "
+                   "using host buffer";
+        }
+        return gdr_mode;
+    }
+    if (buffer_mode != "auto") {
+        LOG(WARNING) << "Unknown MC_UB_BUFFER_MODE=\"" << buffer_mode
+                     << "\", fallback to auto";
+    }
+
+    return gdr_mode;
+#else
+    return false;
+#endif
+}
+
+static void applyUbBufferMode() {
+#if defined(USE_CUDA)
+    if (FLAGS_protocol != "ub") return;
+    FLAGS_use_vram = ubShouldUseVramBuffer();
+    LOG(INFO) << "UB buffer mode selects "
+              << (FLAGS_use_vram ? "GPU buffer" : "host buffer");
+#elif defined(USE_MUSA) || defined(USE_HIP) || defined(USE_MACA) ||      \
+    defined(USE_HYGON) || defined(USE_COREX) || defined(USE_UBSHMEM) || \
+    defined(USE_SUNRISE)
+    if (FLAGS_protocol != "ub") return;
+    const char* gpu_mode_env = std::getenv("MC_UB_GPU_MODE");
+    if (gpu_mode_env && std::string(gpu_mode_env) == "gdr") {
+        LOG(ERROR) << "MC_UB_GPU_MODE=gdr requires a CUDA build";
+        std::exit(EXIT_FAILURE);
+    }
+    FLAGS_use_vram = false;
+    LOG(INFO) << "UB buffer mode selects host buffer; GDR is CUDA-only";
+#else
+    if (FLAGS_protocol != "ub") return;
+    const char* gpu_mode_env = std::getenv("MC_UB_GPU_MODE");
+    if (gpu_mode_env && std::string(gpu_mode_env) == "gdr") {
+        LOG(ERROR) << "MC_UB_GPU_MODE=gdr requires a CUDA build";
+        std::exit(EXIT_FAILURE);
+    }
+#endif
+}
+
+static bool ubGdrBufferModeEnabled() {
+    const char* gpu_mode_env = std::getenv("MC_UB_GPU_MODE");
+    return gpu_mode_env && std::string(gpu_mode_env) == "gdr";
+}
+
 static void* allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_UBSHMEM) || defined(USE_SUNRISE)
     if (from_vram) {
+        if (FLAGS_protocol == "ub" && ubGdrBufferModeEnabled()) {
+            int gpu_id = FLAGS_gpu_id == -1 ? buffer_id : FLAGS_gpu_id;
+            LOG(INFO) << "Allocating UB GDR memory on GPU " << gpu_id;
+            void* d_buf = ub_allocate_memory_gdr(size, gpu_id);
+            if (!d_buf) {
+                return nullptr;
+            }
+            if (FLAGS_init_mem) {
+                checkCudaError(cudaSetDevice(gpu_id),
+                               "Failed to set device for UB GDR init");
+                checkCudaError(cudaMemset(d_buf, 0xCC, size),
+                               "Failed to initialize UB GDR memory");
+                checkCudaError(cudaStreamSynchronize(0),
+                               "Failed to synchronize UB GDR memory");
+            }
+            return d_buf;
+        }
         int gpu_id;
         if (FLAGS_gpu_id == -1) {
             gpu_id = buffer_id;
@@ -221,7 +306,9 @@ static void freeMemoryPool(void* addr, size_t size) {
 #ifndef USE_UBSHMEM
         // Check FLAGS_use_vram first to avoid unnecessary CUDA calls in non-GPU
         // environments
-        if (!FLAGS_use_vram) {
+        if (FLAGS_protocol == "ub" && ub_is_gdr_memory(addr)) {
+            ub_free_memory_gdr(addr);
+        } else if (!FLAGS_use_vram) {
             // Memory was allocated via numa_alloc_onnode, free it directly
             numa_free(addr, size);
         } else {
@@ -253,7 +340,12 @@ static void freeMemoryPool(void* addr, size_t size) {
     }
 #else
     if (FLAGS_protocol == "ub") {
-        munmap(addr, size);  // for urma
+        if (ub_is_gdr_memory(addr)) {
+            ub_free_memory_gdr(addr);
+            return;
+        }
+        numa_free(addr, size);
+        return;
     }
     numa_free(addr, size);
 #endif
@@ -846,6 +938,7 @@ void check_total_buffer_size() {
 
 int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
+    applyUbBufferMode();
     check_total_buffer_size();
 
 #if defined(USE_UBSHMEM)

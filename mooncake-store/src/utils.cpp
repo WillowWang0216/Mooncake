@@ -58,6 +58,8 @@ DEFINE_uint64(mmap_arena_pool_size, 8ULL * 1024 * 1024 * 1024,
 
 namespace mooncake {
 
+static bool ubShouldUseGdrBuffer(const std::string& protocol);
+
 bool isPortAvailable(int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return false;
@@ -129,6 +131,14 @@ void *allocate_buffer_allocator_memory(size_t total_size,
 #endif
 #if defined(USE_UB)
     if (protocol == "ub") {
+        if (ubShouldUseGdrBuffer(protocol)) {
+#if defined(USE_CUDA)
+            return mooncake::ub_allocate_memory_gdr(total_size);
+#else
+            LOG(ERROR) << "MC_UB_GPU_MODE=gdr requires a CUDA build";
+            return nullptr;
+#endif
+        }
         return mooncake::ub_allocate_memory(alignment, total_size);
     }
 #endif
@@ -136,11 +146,6 @@ void *allocate_buffer_allocator_memory(size_t total_size,
     if (use_spdk_dma && total_size > 0) {
         return mooncake::SpdkWrapper::GetInstance().Alloc(total_size, alignment,
                                                           -1);
-    }
-#endif
-#if defined(USE_UB)
-    if (protocol == "ub") {
-        return mooncake::ub_allocate_memory(alignment, total_size);
     }
 #endif
     // Allocate aligned memory
@@ -230,6 +235,38 @@ static void initializeGlobalArena() {
                       "want to retry arena bring-up";
         g_mmap_arena.reset();
     }
+}
+
+static bool ubShouldUseGdrBuffer(const std::string& protocol) {
+    if (protocol != "ub") return false;
+    const char* gpu_mode_env = std::getenv("MC_UB_GPU_MODE");
+    const bool gdr_mode =
+        gpu_mode_env && std::string(gpu_mode_env) == "gdr";
+
+    const char* buffer_mode_env = std::getenv("MC_UB_BUFFER_MODE");
+    std::string buffer_mode = buffer_mode_env ? buffer_mode_env : "auto";
+    if (buffer_mode == "host") {
+        if (gdr_mode) {
+            LOG(WARNING)
+                << "MC_UB_GPU_MODE=gdr requires GPU buffer; ignoring "
+                   "MC_UB_BUFFER_MODE=host";
+        }
+        return gdr_mode;
+    }
+    if (buffer_mode == "gpu") {
+        if (!gdr_mode) {
+            LOG(WARNING)
+                << "MC_UB_BUFFER_MODE=gpu requires MC_UB_GPU_MODE=gdr; "
+                   "using host buffer";
+        }
+        return gdr_mode;
+    }
+    if (buffer_mode != "auto") {
+        LOG(WARNING) << "Unknown MC_UB_BUFFER_MODE=\"" << buffer_mode
+                     << "\", fallback to auto";
+    }
+
+    return gdr_mode;
 }
 
 // Compute the mmap/munmap size for the fallback (non-arena) path.
@@ -542,7 +579,11 @@ void free_memory(const std::string &protocol, void *ptr, bool use_spdk_dma) {
 #endif
 #if defined(USE_UB)
     if (protocol == "ub") {
-        mooncake::ub_free_memory(ptr);
+        if (mooncake::ub_is_gdr_memory(ptr)) {
+            mooncake::ub_free_memory_gdr(ptr);
+        } else {
+            mooncake::ub_free_memory(ptr);
+        }
         return;
     }
 #endif

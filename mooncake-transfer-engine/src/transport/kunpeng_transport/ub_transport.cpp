@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <future>
 #include <string>
 #include <utility>
@@ -86,13 +87,48 @@ UbTransport::~UbTransport() {
 }
 
 bool UbTransport::stagingEnabled() const {
+    return gpuMode() == GpuMode::kStaging;
+}
+
+UbTransport::GpuMode UbTransport::gpuMode() const {
     std::call_once(staging_config_once_, [this] {
+        const char* mode_env = std::getenv("MC_UB_GPU_MODE");
+        if (mode_env) {
+            std::string mode(mode_env);
+            if (mode == "host") {
+                gpu_mode_ = GpuMode::kHost;
+            } else if (mode == "staging") {
+                gpu_mode_ = GpuMode::kStaging;
+            } else if (mode == "gdr") {
+                gpu_mode_ = GpuMode::kGdr;
+            } else {
+                LOG(WARNING) << "Unknown MC_UB_GPU_MODE=\"" << mode
+                             << "\", fallback to staging";
+                gpu_mode_ = GpuMode::kStaging;
+            }
+            LOG(INFO) << "UbTransport GPU mode: " << gpuModeName();
+            return;
+        }
+
         const char* env = std::getenv("MC_UB_TRANSPORT_CPU_STAGING");
-        staging_enabled_ = !env || std::string(env) != "0";
-        LOG(INFO) << "UbTransport CPU staging "
-                  << (staging_enabled_ ? "enabled" : "disabled");
+        gpu_mode_ = (!env || std::string(env) != "0") ? GpuMode::kStaging
+                                                       : GpuMode::kHost;
+        LOG(INFO) << "UbTransport GPU mode: " << gpuModeName()
+                  << " (derived from MC_UB_TRANSPORT_CPU_STAGING)";
     });
-    return staging_enabled_;
+    return gpu_mode_;
+}
+
+const char* UbTransport::gpuModeName() const {
+    switch (gpu_mode_) {
+        case GpuMode::kHost:
+            return "host";
+        case GpuMode::kStaging:
+            return "staging";
+        case GpuMode::kGdr:
+            return "gdr";
+    }
+    return "unknown";
 }
 
 bool UbTransport::isDevicePointer(const void* ptr) const {
@@ -108,6 +144,63 @@ bool UbTransport::isDevicePointer(const void* ptr) const {
     return attributes.type == cudaMemoryTypeDevice;
 #else
     return false;
+#endif
+}
+
+int UbTransport::prepareGdrDeviceMemory(void* addr, size_t length) const {
+    if (!addr || length == 0) return ERR_INVALID_ARGUMENT;
+#if defined(USE_CUDA)
+    bool has_gdr_module = false;
+    std::ifstream modules("/proc/modules");
+    std::string module_name;
+    while (modules >> module_name) {
+        if (module_name == "nvidia_peermem") {
+            has_gdr_module = true;
+            break;
+        }
+        std::string rest;
+        std::getline(modules, rest);
+    }
+    if (!has_gdr_module) {
+        LOG(ERROR) << "UbTransport GDR requires nvidia_peermem kernel module";
+        return ERR_CONTEXT;
+    }
+
+    cudaPointerAttributes attributes;
+    auto status = cudaPointerGetAttributes(&attributes, addr);
+    if (status != cudaSuccess || attributes.type != cudaMemoryTypeDevice) {
+        LOG(ERROR) << "UbTransport GDR requires CUDA device memory, addr="
+                   << addr;
+        return ERR_INVALID_ARGUMENT;
+    }
+
+    int old_device = -1;
+    (void)cudaGetDevice(&old_device);
+    if (cudaSetDevice(attributes.device) != cudaSuccess) {
+        LOG(ERROR) << "UbTransport GDR failed to set CUDA device "
+                   << attributes.device;
+        return ERR_CONTEXT;
+    }
+
+    unsigned int enable = 1;
+    CUresult cu_ret = cuPointerSetAttribute(
+        &enable, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
+        reinterpret_cast<CUdeviceptr>(addr));
+    if (old_device >= 0) (void)cudaSetDevice(old_device);
+    if (cu_ret != CUDA_SUCCESS) {
+        const char* err_str = nullptr;
+        (void)cuGetErrorString(cu_ret, &err_str);
+        LOG(ERROR) << "UbTransport GDR failed to set SYNC_MEMOPS for addr="
+                   << addr << ", cuda error="
+                   << (err_str ? err_str : "unknown");
+        return ERR_CONTEXT;
+    }
+    return 0;
+#else
+    (void)addr;
+    (void)length;
+    LOG(ERROR) << "UbTransport GDR is only supported in USE_CUDA builds";
+    return ERR_INVALID_ARGUMENT;
 #endif
 }
 
@@ -441,27 +534,51 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
                                      const std::string& name,
                                      bool remote_accessible,
                                      bool update_metadata) {
-    if (isDevicePointer(addr)) {
-        if (!stagingEnabled()) {
-            LOG(ERROR) << "UbTransport: refusing to register device memory "
-                          "while CPU staging is disabled, addr="
-                       << addr << " length=" << length;
-            return ERR_INVALID_ARGUMENT;
+    const bool device_pointer = isDevicePointer(addr);
+    const auto mode = gpuMode();
+    if (mode == GpuMode::kGdr && !device_pointer) {
+        LOG(ERROR) << "UbTransport: GDR mode requires device memory, addr="
+                   << addr << " length=" << length;
+        return ERR_INVALID_ARGUMENT;
+    }
+    if (device_pointer) {
+        switch (mode) {
+            case GpuMode::kHost:
+                LOG(ERROR) << "UbTransport: refusing to register device memory "
+                              "in host mode, addr="
+                           << addr << " length=" << length;
+                return ERR_INVALID_ARGUMENT;
+            case GpuMode::kStaging:
+                return registerLogicalDeviceRegion(addr, length, name,
+                                                   remote_accessible);
+            case GpuMode::kGdr:
+                break;
         }
-        return registerLogicalDeviceRegion(addr, length, name,
-                                           remote_accessible);
+        int ret = prepareGdrDeviceMemory(addr, length);
+        if (ret) return ret;
     }
 
     BufferDesc buffer_desc;
+    const auto region_type = device_pointer ? UbMemoryRegionType::kGpuGdr
+                                            : UbMemoryRegionType::kHost;
+    std::vector<std::shared_ptr<UbContext>> registered_contexts;
     for (auto& context : context_list_) {
-        int ret = context->registerMemoryRegion((uint64_t)addr, length);
+        int ret = context->registerMemoryRegion((uint64_t)addr, length,
+                                                region_type);
         if (ret) {
             LOG(ERROR) << "UbTransport: cannot register LocalMemory";
+            for (auto& registered_context : registered_contexts) {
+                registered_context->unregisterMemoryRegion((uint64_t)addr);
+            }
             return ret;
         }
+        registered_contexts.push_back(context);
         ret = context->buildLocalBufferDesc((uint64_t)addr, buffer_desc);
         if (ret) {
             LOG(ERROR) << "UbTransport: build buffer description failed";
+            for (auto& registered_context : registered_contexts) {
+                registered_context->unregisterMemoryRegion((uint64_t)addr);
+            }
             return ret;
         }
     }
@@ -472,7 +589,12 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
         bool only_first_page = true;
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length, only_first_page);
-        if (entries.empty()) return -1;
+        if (entries.empty()) {
+            for (auto& registered_context : registered_contexts) {
+                registered_context->unregisterMemoryRegion((uint64_t)addr);
+            }
+            return -1;
+        }
         buffer_desc.name = entries[0].location;
         buffer_desc.addr = (uint64_t)addr;
         buffer_desc.length = length;
@@ -481,7 +603,12 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
         int node = parseCpuNumaNode(buffer_desc.name);
         if (node >= 0) buffer_desc.chip_id = numaNodeToChipId(node);
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-        if (rc) return rc;
+        if (rc) {
+            for (auto& registered_context : registered_contexts) {
+                registered_context->unregisterMemoryRegion((uint64_t)addr);
+            }
+            return rc;
+        }
     } else {
         buffer_desc.name = name;
         buffer_desc.addr = (uint64_t)addr;
@@ -489,7 +616,12 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
         int node = parseCpuNumaNode(buffer_desc.name);
         if (node >= 0) buffer_desc.chip_id = numaNodeToChipId(node);
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-        if (rc) return rc;
+        if (rc) {
+            for (auto& registered_context : registered_contexts) {
+                registered_context->unregisterMemoryRegion((uint64_t)addr);
+            }
+            return rc;
+        }
     }
 
     return 0;
@@ -606,10 +738,16 @@ Status UbTransport::submitTransferTask(
         StagingLease staging_lease;
         bool staged_request = false;
 
-        if (isDevicePointer(request.source)) {
-            if (!stagingEnabled()) {
+        const bool device_source = isDevicePointer(request.source);
+        const auto mode = gpuMode();
+        if (mode == GpuMode::kGdr && !device_source) {
+            return Status::InvalidArgument(
+                "UbTransport: GDR mode requires device source pointer");
+        }
+        if (device_source && mode != GpuMode::kGdr) {
+            if (mode == GpuMode::kHost) {
                 return Status::InvalidArgument(
-                    "UbTransport: device pointer requires CPU staging");
+                    "UbTransport: device pointer is not allowed in host mode");
             }
             if (!isLogicalDeviceRange(request.source, request.length)) {
                 return Status::AddressNotRegistered(

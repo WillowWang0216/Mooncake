@@ -1,11 +1,13 @@
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 #include <glog/logging.h>
 #include <numa.h>
 
+#include "cuda_alike.h"
 #include "ub_allocator.h"
 
 namespace mooncake {
@@ -15,6 +17,11 @@ struct UbStoreMemRange {
 };
 std::mutex g_ub_store_mem_mutex;
 std::vector<UbStoreMemRange> g_ub_store_mem_ranges;
+
+#if defined(USE_CUDA)
+std::mutex g_ub_gdr_mem_mutex;
+std::unordered_map<void*, int> g_ub_gdr_mem_devices;
+#endif
 
 size_t remove_store_memory_range(void* ptr) {
     std::lock_guard<std::mutex> store_lock(g_ub_store_mem_mutex);
@@ -60,6 +67,86 @@ void* ub_allocate_memory(size_t alignment, size_t total_size) {
     return ub_allocate_memory_onnode(alignment, total_size, -1);
 }
 
+void* ub_allocate_memory_gdr(size_t total_size, int device_id) {
+    if (total_size == 0) {
+        LOG(ERROR) << "UB GDR allocation requires non-zero size";
+        return nullptr;
+    }
+#if defined(USE_CUDA)
+    CUresult init_ret = cuInit(0);
+    if (init_ret != CUDA_SUCCESS) {
+        const char* err_str = nullptr;
+        (void)cuGetErrorString(init_ret, &err_str);
+        LOG(ERROR) << "UB GDR: cuInit failed, error="
+                   << (err_str ? err_str : "unknown");
+        return nullptr;
+    }
+
+    int old_device = -1;
+    if (cudaGetDevice(&old_device) != cudaSuccess) {
+        old_device = -1;
+    }
+    int target_device = device_id;
+    if (target_device < 0) {
+        if (old_device >= 0) {
+            target_device = old_device;
+        } else {
+            target_device = 0;
+        }
+    }
+    if (cudaSetDevice(target_device) != cudaSuccess) {
+        LOG(ERROR) << "UB GDR: failed to set CUDA device " << target_device;
+        return nullptr;
+    }
+
+    CUdeviceptr dptr = 0;
+    CUresult cu_ret = cuMemAlloc(&dptr, total_size);
+    if (old_device >= 0) {
+        (void)cudaSetDevice(old_device);
+    }
+    if (cu_ret != CUDA_SUCCESS) {
+        const char* err_str = nullptr;
+        (void)cuGetErrorString(cu_ret, &err_str);
+        LOG(ERROR) << "UB GDR: cuMemAlloc failed for size " << total_size
+                   << ", error=" << (err_str ? err_str : "unknown");
+        return nullptr;
+    }
+
+    unsigned int enable = 1;
+    if (cudaSetDevice(target_device) != cudaSuccess) {
+        (void)cuMemFree(dptr);
+        LOG(ERROR) << "UB GDR: failed to re-select device for SYNC_MEMOPS";
+        return nullptr;
+    }
+    cu_ret = cuPointerSetAttribute(&enable, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
+                                   dptr);
+    if (old_device >= 0) {
+        (void)cudaSetDevice(old_device);
+    }
+    if (cu_ret != CUDA_SUCCESS) {
+        const char* err_str = nullptr;
+        (void)cuGetErrorString(cu_ret, &err_str);
+        (void)cuMemFree(dptr);
+        LOG(ERROR) << "UB GDR: failed to set SYNC_MEMOPS, error="
+                   << (err_str ? err_str : "unknown");
+        return nullptr;
+    }
+
+    void* ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(dptr));
+    {
+        std::lock_guard<std::mutex> gdr_lock(g_ub_gdr_mem_mutex);
+        g_ub_gdr_mem_devices[ptr] = target_device;
+    }
+    LOG(INFO) << "UB GDR: allocated total size " << total_size
+              << ", device " << target_device << ", addr " << ptr;
+    return ptr;
+#else
+    (void)device_id;
+    LOG(ERROR) << "UB GDR allocation is only supported in USE_CUDA builds";
+    return nullptr;
+#endif
+}
+
 void ub_free_memory(void* ptr) {
     if (!ptr) {
         return;
@@ -67,6 +154,59 @@ void ub_free_memory(void* ptr) {
     auto size = remove_store_memory_range(ptr);
     numa_free(ptr, size);
     LOG(INFO) << "UB: freed  bytes at " << ptr;
+}
+
+void ub_free_memory_gdr(void* ptr) {
+    if (!ptr) {
+        return;
+    }
+#if defined(USE_CUDA)
+    int device_id = -1;
+    {
+        std::lock_guard<std::mutex> gdr_lock(g_ub_gdr_mem_mutex);
+        auto it = g_ub_gdr_mem_devices.find(ptr);
+        if (it != g_ub_gdr_mem_devices.end()) {
+            device_id = it->second;
+            g_ub_gdr_mem_devices.erase(it);
+        }
+    }
+
+    int old_device = -1;
+    if (cudaGetDevice(&old_device) != cudaSuccess) {
+        old_device = -1;
+    }
+    if (device_id >= 0 && cudaSetDevice(device_id) != cudaSuccess) {
+        LOG(ERROR) << "UB GDR: failed to select device " << device_id
+                   << " for free";
+        return;
+    }
+    CUresult cu_ret = cuMemFree(reinterpret_cast<CUdeviceptr>(ptr));
+    if (old_device >= 0) {
+        (void)cudaSetDevice(old_device);
+    }
+    if (cu_ret != CUDA_SUCCESS) {
+        const char* err_str = nullptr;
+        (void)cuGetErrorString(cu_ret, &err_str);
+        LOG(ERROR) << "UB GDR: cuMemFree failed for " << ptr
+                   << ", error=" << (err_str ? err_str : "unknown");
+        return;
+    }
+    LOG(INFO) << "UB GDR: freed bytes at " << ptr;
+#else
+    (void)ptr;
+    LOG(ERROR) << "UB GDR free is only supported in USE_CUDA builds";
+#endif
+}
+
+bool ub_is_gdr_memory(void* ptr) {
+    if (!ptr) return false;
+#if defined(USE_CUDA)
+    std::lock_guard<std::mutex> gdr_lock(g_ub_gdr_mem_mutex);
+    return g_ub_gdr_mem_devices.find(ptr) != g_ub_gdr_mem_devices.end();
+#else
+    (void)ptr;
+    return false;
+#endif
 }
 
 bool ub_is_store_memory(void* addr, size_t length) {
