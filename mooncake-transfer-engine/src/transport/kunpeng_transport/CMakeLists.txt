@@ -2,8 +2,16 @@ file(GLOB UB_SOURCES "*.cpp" "urma/urma_endpoint.cpp" "ub_allocator.cpp")
 
 include(CheckCXXSourceCompiles)
 
-# Check if liburma.so exists
-find_library(URMA_LIBRARY urma PATHS /usr/lib64)
+# Allow the caller to pin the exact liburma.so path; otherwise fall back to the
+# system lookup used by the current UB transport build.
+set(URMA_LIBRARY "" CACHE FILEPATH "Path to liburma.so for UB transport")
+if(NOT URMA_LIBRARY OR URMA_LIBRARY STREQUAL "")
+    find_library(URMA_LIBRARY urma PATHS /usr/lib64 /usr/local/lib64 /usr/lib)
+endif()
+if(URMA_LIBRARY AND NOT EXISTS "${URMA_LIBRARY}")
+    message(FATAL_ERROR
+            "URMA_LIBRARY is set to '${URMA_LIBRARY}', but the file does not exist.")
+endif()
 
 # Build ub_transport with real URMA library if available
 # Never include mock_urma_api.cpp in ub_transport library
