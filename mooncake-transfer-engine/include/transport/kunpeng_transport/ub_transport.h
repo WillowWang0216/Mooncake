@@ -37,6 +37,15 @@ class UbWorkerpool;
 
 enum UB_ENDPOINT_TYPE { URMA_ENDPOINT = 0, OBMM_ENDPOINT = 1 };
 
+// GPU memory access path selected per-process via MC_UB_GPU_MODE.
+enum class UbGpuMode {
+    kHost,        // host (default): CPU memory only, no GPU involvement
+    kStaging,     // staging: GPU buffer + per-buffer host staging buffer (NIC
+                  //         only sees host memory, cudaMemcpy does H2D/D2H)
+    kGdrPeermem,  // gdr-peermem: NIC directly DMA GPU HBM via peermem
+                  //              (seg_cfg.is_gpu_seg = 1)
+};
+
 // ub transport supports integration of endpoints that use UB protocol software.
 // Currently, two types of endpoints are supported: urma and obmm.
 // urma link : https://atomgit.com/openeuler/umdk
@@ -91,54 +100,21 @@ class UbTransport : public Transport {
    private:
     int allocateLocalSegmentID();
 
-    struct StagingLease {
+    // Per-buffer staging mapping: GPU VA -> its dedicated host staging buffer
+    // (registered with URMA so the NIC can DMA it). Used only in kStaging mode.
+    struct StagingMapping {
         void* host_ptr = nullptr;
         size_t size = 0;
     };
 
-    struct DeviceRegion {
-        uint64_t addr = 0;
-        size_t length = 0;
-        std::string location;
-        bool remote_accessible = true;
-    };
-
-    struct StagingState {
-        void* original_device_ptr = nullptr;
-        void* staging_ptr = nullptr;
-        size_t size = 0;
-        size_t lease_size = 0;
-        TransferRequest::OpCode opcode = TransferRequest::WRITE;
-        std::atomic<uint64_t> completed_slices{0};
-        uint64_t total_slices = 0;
-        std::atomic<bool> failed{false};
-        std::mutex deferred_mutex;
-        std::vector<Slice*> deferred_success_slices;
-    };
-
-    bool stagingEnabled() const;
+    UbGpuMode gpuMode() const;
+    const char* gpuModeName() const;
     bool isDevicePointer(const void* ptr) const;
-    bool isLogicalDeviceRange(const void* ptr, size_t length) const;
-    int registerLogicalDeviceRegion(void* addr, size_t length,
-                                    const std::string& location,
-                                    bool remote_accessible);
-    int unregisterLogicalDeviceRegion(void* addr);
     bool copyDeviceToHost(void* dst, const void* src, size_t size) const;
     bool copyHostToDevice(void* dst, const void* src, size_t size) const;
-    Status acquireStaging(size_t size, StagingLease& lease);
-    void releaseStaging(const StagingLease& lease);
-    bool isStagedSlice(Slice* slice);
+    // Staged READ: defer success until H2D finishes (used by poll path).
     bool shouldDeferSuccess(Slice* slice);
-    void attachStaging(TransferTask* task,
-                       std::shared_ptr<StagingState> state);
-    void attachStagingSlice(Slice* slice,
-                            const std::shared_ptr<StagingState>& state);
-    void detachStagingSlice(Slice* slice);
-    std::shared_ptr<StagingState> stagingStateForSlice(Slice* slice);
-    void cleanupStagingForTask(TransferTask* task,
-                               bool detach_all_slices = false);
     void onStagedSliceSuccess(Slice* slice);
-    void onStagedSliceFinalFailure(Slice* slice);
 
    public:
     int onSetupConnections(const HandShakeDesc& peer_desc,
@@ -177,20 +153,13 @@ class UbTransport : public Transport {
     UB_ENDPOINT_TYPE endpoint_type_;
     bool runtime_initialized_ = false;
 
-    mutable std::once_flag staging_config_once_;
-    mutable bool staging_enabled_ = false;
-    mutable std::mutex device_region_mutex_;
-    std::vector<DeviceRegion> device_regions_;
-    std::mutex staging_pool_mutex_;
-    void* staging_pool_base_ = nullptr;
-    size_t staging_pool_size_ = 0;
-    size_t staging_pool_offset_ = 0;
-    std::deque<std::pair<void*, size_t>> staging_free_list_;
-    std::mutex staging_state_mutex_;
-    std::unordered_map<TransferTask*, std::shared_ptr<StagingState>>
-        task_staging_map_;
-    std::unordered_map<Slice*, std::shared_ptr<StagingState>>
-        slice_staging_map_;
+    mutable std::once_flag gpu_mode_once_;
+    mutable UbGpuMode gpu_mode_ = UbGpuMode::kStaging;
+    std::mutex staging_map_mutex_;
+    std::unordered_map<void*, StagingMapping> staging_map_;  // GPU_VA -> host staging
+    std::mutex staged_read_mutex_;
+    // Slice -> original GPU VA for staged READ H2D completion.
+    std::unordered_map<Slice*, void*> staged_read_slices_;
 };
 }  // namespace mooncake
 

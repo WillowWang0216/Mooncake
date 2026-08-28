@@ -34,37 +34,7 @@
 namespace mooncake {
 namespace {
 constexpr uint64_t kNumaAffinitySampleInterval = 10000;
-constexpr size_t kDefaultUbStagingPoolSize = 1ull << 30;
 
-size_t alignUp(size_t value, size_t alignment) {
-    return (value + alignment - 1) / alignment * alignment;
-}
-
-uint64_t countUbSlices(size_t length, size_t block_size,
-                       size_t fragment_size) {
-    uint64_t count = 0;
-    for (uint64_t offset = 0; offset < length; offset += block_size) {
-        ++count;
-        if (length - offset <= block_size + fragment_size) break;
-    }
-    return count;
-}
-
-size_t getUbStagingPoolSize() {
-    static const size_t pool_size = [] {
-        const char* env = std::getenv("MC_UB_STAGING_POOL_SIZE");
-        if (!env) return kDefaultUbStagingPoolSize;
-        try {
-            size_t value = std::stoull(env);
-            if (value > 0) return value;
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Invalid MC_UB_STAGING_POOL_SIZE value: " << env
-                         << ", error: " << e.what();
-        }
-        return kDefaultUbStagingPoolSize;
-    }();
-    return pool_size;
-}
 }  // namespace
 
 UbTransport::UbTransport(UB_ENDPOINT_TYPE endpoint_type)
@@ -74,25 +44,48 @@ UbTransport::~UbTransport() {
 #ifdef CONFIG_USE_BATCH_DESC_SET
     batch_desc_set_.clear();
 #endif
-    if (staging_pool_base_) {
-        unregisterLocalMemory(staging_pool_base_, true);
-        ub_free_memory(staging_pool_base_);
-        staging_pool_base_ = nullptr;
-        staging_pool_size_ = 0;
-    }
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
     context_list_.clear();
 }
 
-bool UbTransport::stagingEnabled() const {
-    std::call_once(staging_config_once_, [this] {
-        const char* env = std::getenv("MC_UB_TRANSPORT_CPU_STAGING");
-        staging_enabled_ = !env || std::string(env) != "0";
-        LOG(INFO) << "UbTransport CPU staging "
-                  << (staging_enabled_ ? "enabled" : "disabled");
+UbGpuMode UbTransport::gpuMode() const {
+    std::call_once(gpu_mode_once_, [this] {
+        const char* env = std::getenv("MC_UB_GPU_MODE");
+        if (env) {
+            std::string mode(env);
+            if (mode == "host") {
+                gpu_mode_ = UbGpuMode::kHost;
+            } else if (mode == "staging") {
+                gpu_mode_ = UbGpuMode::kStaging;
+            } else if (mode == "gdr-peermem") {
+                gpu_mode_ = UbGpuMode::kGdrPeermem;
+            } else {
+                LOG(WARNING) << "Unknown MC_UB_GPU_MODE=\"" << mode
+                             << "\", fallback to staging";
+                gpu_mode_ = UbGpuMode::kStaging;
+            }
+            LOG(INFO) << "UbTransport GPU mode: " << gpuModeName();
+            return;
+        }
+
+        const char* env_legacy = std::getenv("MC_UB_TRANSPORT_CPU_STAGING");
+        gpu_mode_ = (!env_legacy || std::string(env_legacy) != "0")
+                        ? UbGpuMode::kStaging
+                        : UbGpuMode::kHost;
+        LOG(INFO) << "UbTransport GPU mode: " << gpuModeName()
+                  << " (derived from MC_UB_TRANSPORT_CPU_STAGING)";
     });
-    return staging_enabled_;
+    return gpu_mode_;
+}
+
+const char* UbTransport::gpuModeName() const {
+    switch (gpu_mode_) {
+        case UbGpuMode::kHost: return "host";
+        case UbGpuMode::kStaging: return "staging";
+        case UbGpuMode::kGdrPeermem: return "gdr-peermem";
+    }
+    return "unknown";
 }
 
 bool UbTransport::isDevicePointer(const void* ptr) const {
@@ -109,55 +102,6 @@ bool UbTransport::isDevicePointer(const void* ptr) const {
 #else
     return false;
 #endif
-}
-
-bool UbTransport::isLogicalDeviceRange(const void* ptr, size_t length) const {
-    if (!ptr || length == 0) return false;
-    uint64_t addr = reinterpret_cast<uint64_t>(ptr);
-    std::lock_guard<std::mutex> lock(device_region_mutex_);
-    for (const auto& region : device_regions_) {
-        if (addr < region.addr || length > region.length) continue;
-        if (addr - region.addr <= region.length - length) return true;
-    }
-    return false;
-}
-
-int UbTransport::registerLogicalDeviceRegion(void* addr, size_t length,
-                                             const std::string& location,
-                                             bool remote_accessible) {
-    if (!addr || length == 0) return ERR_INVALID_ARGUMENT;
-    uint64_t start = reinterpret_cast<uint64_t>(addr);
-    if (start + length < start) return ERR_INVALID_ARGUMENT;
-    uint64_t end = start + length;
-    std::lock_guard<std::mutex> lock(device_region_mutex_);
-    for (const auto& region : device_regions_) {
-        uint64_t region_start = region.addr;
-        uint64_t region_end = region.addr + region.length;
-        if (start < region_end && region_start < end) {
-            LOG(ERROR) << "UbTransport: logical device region overlaps, addr="
-                       << addr << " length=" << length;
-            return ERR_ADDRESS_OVERLAPPED;
-        }
-    }
-    device_regions_.push_back(
-        DeviceRegion{start, length, location, remote_accessible});
-    LOG(INFO) << "UbTransport: registered logical device region addr=" << addr
-              << " length=" << length << " location=" << location;
-    return 0;
-}
-
-int UbTransport::unregisterLogicalDeviceRegion(void* addr) {
-    if (!addr) return ERR_INVALID_ARGUMENT;
-    uint64_t start = reinterpret_cast<uint64_t>(addr);
-    std::lock_guard<std::mutex> lock(device_region_mutex_);
-    for (auto it = device_regions_.begin(); it != device_regions_.end(); ++it) {
-        if (it->addr != start) continue;
-        LOG(INFO) << "UbTransport: unregistered logical device region addr="
-                  << addr << " length=" << it->length;
-        device_regions_.erase(it);
-        return 0;
-    }
-    return ERR_ADDRESS_NOT_REGISTERED;
 }
 
 bool UbTransport::copyDeviceToHost(void* dst, const void* src,
@@ -188,207 +132,30 @@ bool UbTransport::copyHostToDevice(void* dst, const void* src,
 #endif
 }
 
-Status UbTransport::acquireStaging(size_t size, StagingLease& lease) {
-    if (size == 0) return Status::InvalidArgument("zero-sized UB staging");
-    const size_t alignment = 4096;
-    const size_t aligned_size = alignUp(size, alignment);
-
-    std::lock_guard<std::mutex> lock(staging_pool_mutex_);
-    if (!staging_pool_base_) {
-        staging_pool_size_ = std::max(getUbStagingPoolSize(), aligned_size);
-        staging_pool_base_ = ub_allocate_memory(alignment, staging_pool_size_);
-        if (!staging_pool_base_) {
-            return Status::Memory("UbTransport: allocate CPU staging pool");
-        }
-        int ret = registerLocalMemory(staging_pool_base_, staging_pool_size_,
-                                      kWildcardLocation, false, true);
-        if (ret) {
-            ub_free_memory(staging_pool_base_);
-            staging_pool_base_ = nullptr;
-            staging_pool_size_ = 0;
-            return Status::Context(
-                "UbTransport: register CPU staging pool failed");
-        }
-        LOG(INFO) << "UbTransport: registered CPU staging pool base="
-                  << staging_pool_base_ << " size=" << staging_pool_size_;
-    }
-
-    for (auto it = staging_free_list_.begin(); it != staging_free_list_.end();
-         ++it) {
-        if (it->second < aligned_size) continue;
-        lease.host_ptr = it->first;
-        lease.size = it->second;
-        staging_free_list_.erase(it);
-        return Status::OK();
-    }
-
-    if (staging_pool_offset_ + aligned_size > staging_pool_size_) {
-        return Status::Memory("UbTransport: CPU staging pool exhausted");
-    }
-    lease.host_ptr = static_cast<char*>(staging_pool_base_) +
-                     staging_pool_offset_;
-    lease.size = aligned_size;
-    staging_pool_offset_ += aligned_size;
-    return Status::OK();
-}
-
-void UbTransport::releaseStaging(const StagingLease& lease) {
-    if (!lease.host_ptr || lease.size == 0) return;
-    std::lock_guard<std::mutex> lock(staging_pool_mutex_);
-    staging_free_list_.push_back({lease.host_ptr, lease.size});
-}
-
-void UbTransport::attachStaging(TransferTask* task,
-                                std::shared_ptr<StagingState> state) {
-    if (!task || !state) return;
-    std::lock_guard<std::mutex> lock(staging_state_mutex_);
-    task_staging_map_[task] = state;
-}
-
-void UbTransport::attachStagingSlice(
-    Slice* slice, const std::shared_ptr<StagingState>& state) {
-    if (!slice || !state) return;
-    std::lock_guard<std::mutex> lock(staging_state_mutex_);
-    slice_staging_map_[slice] = state;
-}
-
-void UbTransport::detachStagingSlice(Slice* slice) {
-    if (!slice) return;
-    std::lock_guard<std::mutex> lock(staging_state_mutex_);
-    slice_staging_map_.erase(slice);
-}
-
-std::shared_ptr<UbTransport::StagingState> UbTransport::stagingStateForSlice(
-    Slice* slice) {
-    std::lock_guard<std::mutex> lock(staging_state_mutex_);
-    auto it = slice_staging_map_.find(slice);
-    return it == slice_staging_map_.end() ? nullptr : it->second;
-}
-
-bool UbTransport::isStagedSlice(Slice* slice) {
-    return stagingStateForSlice(slice) != nullptr;
-}
-
 bool UbTransport::shouldDeferSuccess(Slice* slice) {
-    auto state = stagingStateForSlice(slice);
-    return state && state->opcode == TransferRequest::READ;
-}
-
-void UbTransport::cleanupStagingForTask(TransferTask* task,
-                                        bool detach_all_slices) {
-    std::shared_ptr<StagingState> state;
-    {
-        std::lock_guard<std::mutex> lock(staging_state_mutex_);
-        auto task_it = task_staging_map_.find(task);
-        if (task_it == task_staging_map_.end()) return;
-        state = task_it->second;
-        task_staging_map_.erase(task_it);
-        if (detach_all_slices) {
-            for (auto* slice : task->slice_list) {
-                slice_staging_map_.erase(slice);
-            }
-        }
-    }
-    releaseStaging(StagingLease{state->staging_ptr, state->lease_size});
+    std::lock_guard<std::mutex> lock(staged_read_mutex_);
+    return staged_read_slices_.find(slice) != staged_read_slices_.end();
 }
 
 void UbTransport::onStagedSliceSuccess(Slice* slice) {
-    auto state = stagingStateForSlice(slice);
-    if (!state) {
-        slice->markSuccess();
-        return;
-    }
-
-    if (state->opcode == TransferRequest::WRITE) {
-        auto completed =
-            state->completed_slices.fetch_add(1, std::memory_order_acq_rel) +
-            1;
-        if (completed == state->total_slices) {
-            cleanupStagingForTask(slice->task);
-        }
-        detachStagingSlice(slice);
-        slice->markSuccess();
-        return;
-    }
-
-    auto completed =
-        state->completed_slices.fetch_add(1, std::memory_order_acq_rel) + 1;
+    void* gpu_dst = nullptr;
     {
-        std::lock_guard<std::mutex> lock(state->deferred_mutex);
-        state->deferred_success_slices.push_back(slice);
-    }
-    if (completed != state->total_slices) return;
-
-    if (state->failed.load(std::memory_order_acquire)) {
-        std::vector<Slice*> deferred;
-        {
-            std::lock_guard<std::mutex> lock(state->deferred_mutex);
-            deferred.swap(state->deferred_success_slices);
+        std::lock_guard<std::mutex> lock(staged_read_mutex_);
+        auto it = staged_read_slices_.find(slice);
+        if (it == staged_read_slices_.end()) {
+            slice->markSuccess();
+            return;
         }
-        cleanupStagingForTask(slice->task);
-        for (auto* deferred_slice : deferred) {
-            detachStagingSlice(deferred_slice);
-            deferred_slice->markFailed();
-        }
-        return;
+        gpu_dst = it->second;
+        staged_read_slices_.erase(it);
     }
-
-    if (!copyHostToDevice(state->original_device_ptr, state->staging_ptr,
-                          state->size)) {
+    if (!copyHostToDevice(gpu_dst, slice->source_addr, slice->length)) {
         LOG(ERROR) << "UbTransport: H2D staging copy failed for READ, size="
-                   << state->size << " dst=" << state->original_device_ptr;
-        state->failed.store(true, std::memory_order_release);
-        std::vector<Slice*> deferred;
-        {
-            std::lock_guard<std::mutex> lock(state->deferred_mutex);
-            deferred.swap(state->deferred_success_slices);
-        }
-        cleanupStagingForTask(slice->task);
-        for (auto* deferred_slice : deferred) {
-            detachStagingSlice(deferred_slice);
-            deferred_slice->markFailed();
-        }
-        return;
-    }
-
-    std::vector<Slice*> deferred;
-    {
-        std::lock_guard<std::mutex> lock(state->deferred_mutex);
-        deferred.swap(state->deferred_success_slices);
-    }
-    cleanupStagingForTask(slice->task);
-    for (auto* deferred_slice : deferred) {
-        detachStagingSlice(deferred_slice);
-        deferred_slice->markSuccess();
-    }
-}
-
-void UbTransport::onStagedSliceFinalFailure(Slice* slice) {
-    auto state = stagingStateForSlice(slice);
-    if (!state) {
+                   << slice->length << " dst=" << gpu_dst;
         slice->markFailed();
         return;
     }
-    state->failed.store(true, std::memory_order_release);
-    auto completed =
-        state->completed_slices.fetch_add(1, std::memory_order_acq_rel) + 1;
-    detachStagingSlice(slice);
-    if (completed != state->total_slices) {
-        slice->markFailed();
-        return;
-    }
-
-    std::vector<Slice*> deferred;
-    if (state->opcode == TransferRequest::READ) {
-        std::lock_guard<std::mutex> lock(state->deferred_mutex);
-        deferred.swap(state->deferred_success_slices);
-    }
-    cleanupStagingForTask(slice->task);
-    slice->markFailed();
-    for (auto* deferred_slice : deferred) {
-        detachStagingSlice(deferred_slice);
-        deferred_slice->markFailed();
-    }
+    slice->markSuccess();
 }
 
 int UbTransport::install(std::string& local_server_name,
@@ -438,23 +205,51 @@ int UbTransport::install(std::string& local_server_name,
 }
 
 int UbTransport::registerLocalMemory(void* addr, size_t length,
-                                     const std::string& name,
-                                     bool remote_accessible,
-                                     bool update_metadata) {
-    if (isDevicePointer(addr)) {
-        if (!stagingEnabled()) {
-            LOG(ERROR) << "UbTransport: refusing to register device memory "
-                          "while CPU staging is disabled, addr="
-                       << addr << " length=" << length;
-            return ERR_INVALID_ARGUMENT;
+                                      const std::string& name,
+                                      bool remote_accessible,
+                                      bool update_metadata) {
+    const bool is_device_ptr = isDevicePointer(addr);
+    const auto mode = gpuMode();
+    if (mode == UbGpuMode::kGdrPeermem && !is_device_ptr) {
+        LOG(ERROR) << "gdr-peermem requires device memory, addr=" << addr;
+        return ERR_INVALID_ARGUMENT;
+    }
+    if (is_device_ptr) {
+        switch (mode) {
+            case UbGpuMode::kHost:
+                LOG(ERROR) << "refusing device memory in host mode, addr="
+                           << addr;
+                return ERR_INVALID_ARGUMENT;
+            case UbGpuMode::kStaging: {
+                // Per-buffer staging: allocate host barbuffer, register to URMA,
+                // record GPU_VA -> host mapping. GPU buffer itself is not registered.
+                void* host = ub_allocate_memory(4096, length);
+                if (!host) {
+                    LOG(ERROR) << "failed to allocate staging host buffer for "
+                               << addr;
+                    return ERR_MEMORY;
+                }
+                int ret = registerLocalMemory(host, length, kWildcardLocation,
+                                              false, true);
+                if (ret) {
+                    ub_free_memory(host);
+                    return ret;
+                }
+                std::lock_guard<std::mutex> lock(staging_map_mutex_);
+                staging_map_[addr] = {host, length};
+                return 0;
+            }
+            case UbGpuMode::kGdrPeermem:
+                break;
         }
-        return registerLogicalDeviceRegion(addr, length, name,
-                                           remote_accessible);
     }
 
+    const auto region_type = is_device_ptr ? UbMemoryRegionType::kGpu
+                                           : UbMemoryRegionType::kHost;
     BufferDesc buffer_desc;
     for (auto& context : context_list_) {
-        int ret = context->registerMemoryRegion((uint64_t)addr, length);
+        int ret = context->registerMemoryRegion((uint64_t)addr, length,
+                                                region_type);
         if (ret) {
             LOG(ERROR) << "UbTransport: cannot register LocalMemory";
             return ret;
@@ -466,22 +261,26 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
         }
     }
 
-    // Get the memory location automatically after registered MR(pinned),
-    // when the name is kWildcardLocation("*").
     if (name == kWildcardLocation) {
         bool only_first_page = true;
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length, only_first_page);
-        if (entries.empty()) return -1;
+        if (entries.empty()) {
+            for (auto& context : context_list_)
+                context->unregisterMemoryRegion((uint64_t)addr);
+            return -1;
+        }
         buffer_desc.name = entries[0].location;
         buffer_desc.addr = (uint64_t)addr;
         buffer_desc.length = length;
-        // Precompute chip_id for single-NUMA ("cpu:N") buffers so peers read it
-        // directly instead of resolving per-slice. -1 stays for non-cpu names.
         int node = parseCpuNumaNode(buffer_desc.name);
         if (node >= 0) buffer_desc.chip_id = numaNodeToChipId(node);
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-        if (rc) return rc;
+        if (rc) {
+            for (auto& context : context_list_)
+                context->unregisterMemoryRegion((uint64_t)addr);
+            return rc;
+        }
     } else {
         buffer_desc.name = name;
         buffer_desc.addr = (uint64_t)addr;
@@ -489,16 +288,33 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
         int node = parseCpuNumaNode(buffer_desc.name);
         if (node >= 0) buffer_desc.chip_id = numaNodeToChipId(node);
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-        if (rc) return rc;
+        if (rc) {
+            for (auto& context : context_list_)
+                context->unregisterMemoryRegion((uint64_t)addr);
+            return rc;
+        }
     }
 
     return 0;
 }
 
 int UbTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    int logical_rc = unregisterLogicalDeviceRegion(addr);
-    if (logical_rc == 0) return 0;
-
+    const bool is_device_ptr = isDevicePointer(addr);
+    const auto mode = gpuMode();
+    if (is_device_ptr && mode == UbGpuMode::kStaging) {
+        // Staging: unregister the host staging buffer, free it, remove mapping.
+        StagingMapping m;
+        {
+            std::lock_guard<std::mutex> lock(staging_map_mutex_);
+            auto it = staging_map_.find(addr);
+            if (it == staging_map_.end()) return ERR_ADDRESS_NOT_REGISTERED;
+            m = it->second;
+            staging_map_.erase(it);
+        }
+        unregisterLocalMemory(m.host_ptr, true);
+        ub_free_memory(m.host_ptr);
+        return 0;
+    }
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     if (rc) return rc;
     for (auto& context : context_list_)
@@ -602,50 +418,49 @@ Status UbTransport::submitTransferTask(
         assert(task.request);
         auto& request = *task.request;
         void* effective_source = request.source;
-        std::shared_ptr<StagingState> staging_state;
-        StagingLease staging_lease;
-        bool staged_request = false;
+        bool staged_read = false;
+        void* original_gpu_ptr = nullptr;
 
-        if (isDevicePointer(request.source)) {
-            if (!stagingEnabled()) {
+        const bool is_device_source = isDevicePointer(request.source);
+        const auto mode = gpuMode();
+        if (mode == UbGpuMode::kGdrPeermem && !is_device_source) {
+            return Status::InvalidArgument(
+                "UbTransport: gdr-peermem requires device source pointer");
+        }
+        if (is_device_source && mode != UbGpuMode::kGdrPeermem) {
+            if (mode == UbGpuMode::kHost) {
                 return Status::InvalidArgument(
-                    "UbTransport: device pointer requires CPU staging");
+                    "UbTransport: device pointer is not allowed in host mode");
             }
-            if (!isLogicalDeviceRange(request.source, request.length)) {
-                return Status::AddressNotRegistered(
-                    "UbTransport: device pointer is not registered as a "
-                    "logical UB device region, address: " +
-                    std::to_string(
-                        reinterpret_cast<uintptr_t>(request.source)));
+            // kStaging: route through the per-buffer host staging buffer.
+            StagingMapping m;
+            {
+                std::lock_guard<std::mutex> lock(staging_map_mutex_);
+                auto it = staging_map_.find(request.source);
+                if (it == staging_map_.end()) {
+                    return Status::AddressNotRegistered(
+                        "UbTransport: device pointer is not registered for "
+                        "staging, address: " +
+                        std::to_string(
+                            reinterpret_cast<uintptr_t>(request.source)));
+                }
+                m = it->second;
             }
-            auto staging_status = acquireStaging(request.length, staging_lease);
-            if (!staging_status.ok()) return staging_status;
-
-            staging_state = std::make_shared<StagingState>();
-            if (!staging_state) {
-                releaseStaging(staging_lease);
-                return Status::Memory("UbTransport: allocate staging state");
+            effective_source = m.host_ptr;
+            original_gpu_ptr = request.source;
+            if (request.opcode == TransferRequest::WRITE) {
+                if (!copyDeviceToHost(m.host_ptr, request.source,
+                                      request.length)) {
+                    LOG(ERROR)
+                        << "UbTransport: D2H staging copy failed for WRITE, "
+                           "size="
+                        << request.length << " src=" << request.source;
+                    return Status::Memory(
+                        "UbTransport: D2H staging copy failed");
+                }
+            } else {
+                staged_read = true;  // defer success until H2D
             }
-            staging_state->original_device_ptr = request.source;
-            staging_state->staging_ptr = staging_lease.host_ptr;
-            staging_state->size = request.length;
-            staging_state->lease_size = staging_lease.size;
-            staging_state->opcode = request.opcode;
-            staging_state->total_slices =
-                countUbSlices(request.length, kBlockSize, kFragmentSize);
-            effective_source = staging_state->staging_ptr;
-            staged_request = true;
-
-            if (request.opcode == TransferRequest::WRITE &&
-                !copyDeviceToHost(staging_state->staging_ptr, request.source,
-                                  request.length)) {
-                LOG(ERROR)
-                    << "UbTransport: D2H staging copy failed for WRITE, size="
-                    << request.length << " src=" << request.source;
-                releaseStaging(staging_lease);
-                return Status::Memory("UbTransport: D2H staging copy failed");
-            }
-            attachStaging(&task, staging_state);
         }
 
         auto local_segment_desc =
@@ -687,7 +502,13 @@ Status UbTransport::submitTransferTask(
             slice->ub.src_chip_id = INVALID_CHIP_ID;
             slice->ub.dst_chip_id = INVALID_CHIP_ID;
             task.slice_list.push_back(slice);
-            if (staged_request) attachStagingSlice(slice, staging_state);
+            if (staged_read) {
+                uint64_t offset = static_cast<char*>(slice->source_addr) -
+                                  static_cast<char*>(effective_source);
+                void* gpu_dst = static_cast<char*>(original_gpu_ptr) + offset;
+                std::lock_guard<std::mutex> lock(staged_read_mutex_);
+                staged_read_slices_[slice] = gpu_dst;
+            }
 
             int buffer_id = -1, device_id = -1,
                 retry_cnt = request.advise_retry_cnt;
@@ -727,7 +548,6 @@ Status UbTransport::submitTransferTask(
                 LOG(ERROR)
                     << "UbTransport: Address not registered by any device(s) "
                     << source_addr;
-                if (staged_request) cleanupStagingForTask(&task, true);
                 return Status::AddressNotRegistered(
                     "UbTransport: not registered by any device(s), "
                     "address: " +
@@ -737,7 +557,6 @@ Status UbTransport::submitTransferTask(
             auto& context = context_list_[device_id];
             if (!context->active()) {
                 LOG(ERROR) << "Device " << device_id << " is not active";
-                if (staged_request) cleanupStagingForTask(&task, true);
                 return Status::InvalidArgument(
                     "Device " + std::to_string(device_id) + " is not active");
             }
@@ -773,9 +592,9 @@ Status UbTransport::submitTransferTask(
                 }
             }
             slices_to_post[context].push_back(slice);
-            task.total_bytes += slice->length;
+             task.total_bytes += slice->length;
             __sync_fetch_and_add(&task.slice_count, 1);
-            if (!staged_request && nr_slices >= kSubmitWatermark) {
+            if (nr_slices >= kSubmitWatermark) {
                 for (auto& entry : slices_to_post)
                     entry.first->submitPostSend(entry.second);
                 slices_to_post.clear();
@@ -785,9 +604,6 @@ Status UbTransport::submitTransferTask(
             if (merge_final_slice) {
                 break;
             }
-        }
-        if (staged_request && task.slice_count == 0) {
-            cleanupStagingForTask(&task, true);
         }
     }
     for (auto& entry : slices_to_post)
