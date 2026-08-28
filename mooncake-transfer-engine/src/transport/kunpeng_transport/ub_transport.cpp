@@ -34,6 +34,7 @@
 namespace mooncake {
 namespace {
 constexpr uint64_t kNumaAffinitySampleInterval = 10000;
+constexpr uint64_t kSubmitLogSampleInterval = 10000;
 
 }  // namespace
 
@@ -134,7 +135,15 @@ bool UbTransport::copyHostToDevice(void* dst, const void* src,
 
 bool UbTransport::shouldDeferSuccess(Slice* slice) {
     std::lock_guard<std::mutex> lock(staged_read_mutex_);
-    return staged_read_slices_.find(slice) != staged_read_slices_.end();
+    const bool deferred =
+        staged_read_slices_.find(slice) != staged_read_slices_.end();
+    static std::atomic<uint64_t> defer_log_counter{0};
+    if (VLOG_IS_ON(2) && defer_log_counter.fetch_add(
+            1, std::memory_order_relaxed) % kSubmitLogSampleInterval == 0) {
+        VLOG(2) << "[ub_staging] shouldDeferSuccess slice=" << slice
+                << " deferred=" << deferred;
+    }
+    return deferred;
 }
 
 void UbTransport::onStagedSliceSuccess(Slice* slice) {
@@ -154,6 +163,12 @@ void UbTransport::onStagedSliceSuccess(Slice* slice) {
                    << slice->length << " dst=" << gpu_dst;
         slice->markFailed();
         return;
+    }
+    static std::atomic<uint64_t> h2d_log_counter{0};
+    if (VLOG_IS_ON(2) && h2d_log_counter.fetch_add(
+            1, std::memory_order_relaxed) % kSubmitLogSampleInterval == 0) {
+        VLOG(2) << "[ub_staging] H2D done gpu_dst=" << gpu_dst
+                << " len=" << slice->length;
     }
     slice->markSuccess();
 }
@@ -210,6 +225,8 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
                                       bool update_metadata) {
     const bool is_device_ptr = isDevicePointer(addr);
     const auto mode = gpuMode();
+    VLOG(1) << "[ub_register] addr=" << addr << " len=" << length
+            << " mode=" << gpuModeName() << " is_device=" << is_device_ptr;
     if (mode == UbGpuMode::kGdrPeermem && !is_device_ptr) {
         LOG(ERROR) << "gdr-peermem requires device memory, addr=" << addr;
         return ERR_INVALID_ARGUMENT;
@@ -237,9 +254,12 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
                 }
                 std::lock_guard<std::mutex> lock(staging_map_mutex_);
                 staging_map_[addr] = {host, length};
+                VLOG(1) << "[ub_staging] mapped gpu_va=" << addr
+                        << " -> host=" << host << " len=" << length;
                 return 0;
             }
             case UbGpuMode::kGdrPeermem:
+                VLOG(1) << "[ub_gdr] registering GPU region addr=" << addr;
                 break;
         }
     }
@@ -260,6 +280,8 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
             return ret;
         }
     }
+    VLOG(1) << "[ub_register] URMA region addr=" << addr << " type="
+            << (region_type == UbMemoryRegionType::kGpu ? "kGpu" : "kHost");
 
     if (name == kWildcardLocation) {
         bool only_first_page = true;
@@ -301,6 +323,8 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
 int UbTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     const bool is_device_ptr = isDevicePointer(addr);
     const auto mode = gpuMode();
+    VLOG(1) << "[ub_unregister] addr=" << addr << " mode=" << gpuModeName()
+            << " is_device=" << is_device_ptr;
     if (is_device_ptr && mode == UbGpuMode::kStaging) {
         // Staging: unregister the host staging buffer, free it, remove mapping.
         StagingMapping m;
@@ -311,10 +335,13 @@ int UbTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
             m = it->second;
             staging_map_.erase(it);
         }
+        VLOG(1) << "[ub_staging] unmapping gpu_va=" << addr
+                << " host=" << m.host_ptr;
         unregisterLocalMemory(m.host_ptr, true);
         ub_free_memory(m.host_ptr);
         return 0;
     }
+    VLOG(1) << "[ub_unregister] URMA region addr=" << addr;
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     if (rc) return rc;
     for (auto& context : context_list_)
@@ -423,6 +450,18 @@ Status UbTransport::submitTransferTask(
 
         const bool is_device_source = isDevicePointer(request.source);
         const auto mode = gpuMode();
+        static std::atomic<uint64_t> submit_log_counter{0};
+        if (VLOG_IS_ON(2) && submit_log_counter.fetch_add(
+                1, std::memory_order_relaxed) % kSubmitLogSampleInterval == 0) {
+            VLOG(2) << "[ub_transfer] mode=" << gpuModeName()
+                    << " is_device_source=" << is_device_source
+                    << " opcode=" << (request.opcode == TransferRequest::READ
+                                          ? "READ"
+                                          : "WRITE")
+                    << " source=" << request.source
+                    << " effective_source=" << effective_source
+                    << " length=" << request.length;
+        }
         if (mode == UbGpuMode::kGdrPeermem && !is_device_source) {
             return Status::InvalidArgument(
                 "UbTransport: gdr-peermem requires device source pointer");
@@ -458,8 +497,20 @@ Status UbTransport::submitTransferTask(
                     return Status::Memory(
                         "UbTransport: D2H staging copy failed");
                 }
+                if (VLOG_IS_ON(2) && submit_log_counter.load(
+                        std::memory_order_relaxed) % kSubmitLogSampleInterval == 0) {
+                    VLOG(2) << "[ub_staging] D2H done gpu=" << request.source
+                            << " -> host=" << m.host_ptr
+                            << " len=" << request.length;
+                }
             } else {
                 staged_read = true;  // defer success until H2D
+            }
+        } else if (mode == UbGpuMode::kGdrPeermem && is_device_source) {
+            if (VLOG_IS_ON(2) && submit_log_counter.load(
+                    std::memory_order_relaxed) % kSubmitLogSampleInterval == 0) {
+                VLOG(2) << "[ub_gdr] direct source gpu_va=" << request.source
+                        << " len=" << request.length;
             }
         }
 
@@ -508,6 +559,14 @@ Status UbTransport::submitTransferTask(
                 void* gpu_dst = static_cast<char*>(original_gpu_ptr) + offset;
                 std::lock_guard<std::mutex> lock(staged_read_mutex_);
                 staged_read_slices_[slice] = gpu_dst;
+                static std::atomic<uint64_t> staged_read_log_counter{0};
+                if (VLOG_IS_ON(2) && staged_read_log_counter.fetch_add(
+                        1, std::memory_order_relaxed) %
+                        kSubmitLogSampleInterval == 0) {
+                    VLOG(2) << "[ub_staging] staged READ recorded slice="
+                            << slice << " gpu_dst=" << gpu_dst
+                            << " len=" << slice->length;
+                }
             }
 
             int buffer_id = -1, device_id = -1,

@@ -539,6 +539,10 @@ class StressBenchmark {
                 return -1;
             }
             buffer_is_gpu_ = true;
+            VLOG(1) << "[bench] GPU buffer allocated mode="
+                    << gpu_config_.mode << " device=" << FLAGS_gpu_device
+                    << " addr=" << buffer_ << " size=" << buffer_size_
+                    << " is_gpu=" << buffer_is_gpu_;
 #else
             LOG(FATAL) << "gpu_mode requires USE_CUDA and USE_UB build";
 #endif
@@ -1442,6 +1446,13 @@ class StressBenchmark {
             checkCudaError(cudaMemcpy(buffer_, shadow.data(), FLAGS_value_size,
                                       cudaMemcpyHostToDevice),
                            "FillBuffer H2D copy failed");
+            static std::atomic<uint64_t> fill_h2d_log_counter{0};
+            if (VLOG_IS_ON(2) && fill_h2d_log_counter.fetch_add(
+                    1, std::memory_order_relaxed) % 10000 == 0) {
+                VLOG(2) << "[bench] FillBuffer H2D seed=" << seed
+                        << " size=" << FLAGS_value_size
+                        << " dst=" << buffer_;
+            }
         }
 #endif
     }
@@ -1455,6 +1466,12 @@ class StressBenchmark {
             checkCudaError(cudaMemcpy(shadow.data(), data, size,
                                       cudaMemcpyDeviceToHost),
                            "CheckBuffer D2H copy failed");
+            static std::atomic<uint64_t> check_d2h_log_counter{0};
+            if (VLOG_IS_ON(2) && check_d2h_log_counter.fetch_add(
+                    1, std::memory_order_relaxed) % 10000 == 0) {
+                VLOG(2) << "[bench] CheckBuffer D2H seed=" << seed
+                        << " size=" << size << " src=" << data;
+            }
             compare_data = shadow.data();
         }
 #endif
@@ -1719,6 +1736,12 @@ int main(int argc, char* argv[]) {
     GpuRuntimeConfig gpu_config = ResolveGpuConfig();
     ValidateGpuDevice(gpu_config);
     ApplyGpuEnv(gpu_config);
+
+    const char* verbose_env = std::getenv("MC_VERBOSE");
+    if (verbose_env) {
+        FLAGS_v = std::atoi(verbose_env);
+        LOG(INFO) << "Verbose logging enabled: -v=" << FLAGS_v;
+    }
 
     if (std::getenv("MC_LOG_DIR") == nullptr) {
         FLAGS_logtostderr = true;

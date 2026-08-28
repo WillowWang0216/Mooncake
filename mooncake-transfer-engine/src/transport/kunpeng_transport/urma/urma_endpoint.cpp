@@ -359,7 +359,10 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length,
                       << "shrink it to " << globalConfig().max_seg_size;
         length = (size_t)globalConfig().max_seg_size;
     }
-    LOG(INFO) << "Register memory region " << va << " length " << length;
+    const uint32_t is_gpu_seg =
+        (type == UbMemoryRegionType::kGpu) ? 1 : 0;
+    LOG(INFO) << "Register memory region " << va << " length " << length
+              << " is_gpu_seg=" << is_gpu_seg;
     urma_reg_seg_flag_t flag = {};
     flag.bs.token_policy = URMA_TOKEN_NONE;
     flag.bs.cacheable = URMA_NON_CACHEABLE;

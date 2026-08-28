@@ -132,8 +132,8 @@ void* ub_allocate_gpu_hbm(size_t total_size, int device_id) {
         std::lock_guard<std::mutex> gdr_lock(g_ub_gpu_hbm_mutex);
         g_ub_gpu_hbm_devices[ptr] = device_id;
     }
-    LOG(INFO) << "UB GPU HBM: allocated size " << total_size
-              << ", device " << device_id << ", addr " << ptr;
+    VLOG(1) << "UB GPU HBM: allocated size " << total_size
+            << ", device " << device_id << ", addr " << ptr;
     return ptr;
 #else
     (void)device_id;
@@ -174,7 +174,7 @@ void ub_free_gpu_hbm(void* ptr) {
                    << ", error=" << (err_str ? err_str : "unknown");
         return;
     }
-    LOG(INFO) << "UB GPU HBM: freed bytes at " << ptr;
+    VLOG(1) << "UB GPU HBM: freed bytes at " << ptr;
 #else
     (void)ptr;
     LOG(ERROR) << "UB GPU HBM free requires USE_CUDA build";
