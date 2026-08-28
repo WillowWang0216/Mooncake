@@ -13,10 +13,12 @@
 // limitations under the License.
 
 #include <glog/logging.h>
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <iterator>
 #include "config.h"
 #include "mooncake_logging.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
@@ -315,8 +317,26 @@ urma_target_seg_t* UrmaContext::seg(uint64_t addr) {
 
 int UrmaContext::buildLocalBufferDesc(uint64_t addr,
                                       UbTransport::BufferDesc& buffer_desc) {
-    auto str = serializeBinaryData(&seg(addr)->seg, sizeof(urma_seg_t));
-    auto index = local_tseg_list().size() - 1;
+    RWSpinlock::ReadGuard guard(seg_region_lock_);
+    urma_target_seg_t* target_seg = nullptr;
+    for (auto& entry : seg_region_list_) {
+        if (entry.first->seg.ubva.va <= addr &&
+            addr < entry.first->seg.ubva.va + entry.second) {
+            target_seg = entry.first;
+            break;
+        }
+    }
+    if (!target_seg) {
+        LOG(ERROR) << "Address " << addr << " seg not found for "
+                   << deviceName();
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
+    auto iter =
+        std::find(local_tseg_list_.begin(), local_tseg_list_.end(), target_seg);
+    if (iter == local_tseg_list_.end()) return ERR_ADDRESS_NOT_REGISTERED;
+    auto index = static_cast<uint32_t>(
+        std::distance(local_tseg_list_.begin(), iter));
+    auto str = serializeBinaryData(&target_seg->seg, sizeof(urma_seg_t));
     buffer_desc.tseg.push_back(str);
     buffer_desc.l_seg_index.push_back(index);
     return 0;
@@ -326,8 +346,15 @@ void* UrmaContext::localSegWithIndex(unsigned value) {
     return local_tseg_list_.at(value);
 }
 
-int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
+int UrmaContext::registerMemoryRegion(uint64_t va, size_t length,
+                                      UbMemoryRegionType type) {
     if (length > (size_t)globalConfig().max_seg_size) {
+        if (type == UbMemoryRegionType::kGpu) {
+            LOG(ERROR) << "GPU segment length " << length
+                       << " exceeds device max_seg_size "
+                       << globalConfig().max_seg_size;
+            return ERR_INVALID_ARGUMENT;
+        }
         PLOG(WARNING) << "The buffer length exceeds device max_seg_size, "
                       << "shrink it to " << globalConfig().max_seg_size;
         length = (size_t)globalConfig().max_seg_size;
@@ -349,15 +376,16 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
         .user_ctx = (uintptr_t)NULL,
         .iova = 0,
     };
+    seg_cfg.is_gpu_seg = (type == UbMemoryRegionType::kGpu) ? 1 : 0;
     urma_target_seg_t* seg = urma_register_seg(urma_context_, &seg_cfg);
     if (!seg) {
         PLOG(ERROR) << "Failed to register segment " << seg_cfg.va;
         return ERR_CONTEXT;
     }
     LOG(INFO) << "Local seg token id : " << seg->seg.token_id;
-    local_tseg_list_.push_back(seg);
 
     RWSpinlock::WriteGuard guard(seg_region_lock_);
+    local_tseg_list_.push_back(seg);
     seg_region_list_.emplace_back(seg, length);
     return 0;
 }
