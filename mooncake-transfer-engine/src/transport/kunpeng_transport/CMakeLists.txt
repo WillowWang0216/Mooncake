@@ -1,7 +1,17 @@
 file(GLOB UB_SOURCES "*.cpp" "urma/urma_endpoint.cpp" "ub_allocator.cpp")
 
-# Check if liburma.so exists
-find_library(URMA_LIBRARY urma PATHS /usr/lib64)
+include(CheckCXXSourceCompiles)
+
+# Allow the caller to pin the exact liburma.so path; otherwise fall back to the
+# system lookup used by the current UB transport build.
+set(URMA_LIBRARY "" CACHE FILEPATH "Path to liburma.so for UB transport")
+if(NOT URMA_LIBRARY OR URMA_LIBRARY STREQUAL "")
+    find_library(URMA_LIBRARY urma PATHS /usr/lib64 /usr/local/lib64 /usr/lib)
+endif()
+if(URMA_LIBRARY AND NOT EXISTS "${URMA_LIBRARY}")
+    message(FATAL_ERROR
+            "URMA_LIBRARY is set to '${URMA_LIBRARY}', but the file does not exist.")
+endif()
 
 # Build ub_transport with real URMA library if available
 # Never include mock_urma_api.cpp in ub_transport library
@@ -22,10 +32,31 @@ else()
 endif()
 target_include_directories(ub_transport
         PUBLIC
-        ${urma_INCLUDE_DIR}
+        ${URMA_INCLUDE_DIR}
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../mooncake-integration/store
 )
+set(_UB_SAVED_CMAKE_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES})
+set(CMAKE_REQUIRED_INCLUDES ${URMA_INCLUDE_DIR})
+check_cxx_source_compiles("
+#include <urma_api.h>
+int main() {
+    urma_seg_cfg_t cfg = {};
+    cfg.is_gpu_seg = 1;
+    return 0;
+}
+" HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+set(CMAKE_REQUIRED_INCLUDES ${_UB_SAVED_CMAKE_REQUIRED_INCLUDES})
+unset(_UB_SAVED_CMAKE_REQUIRED_INCLUDES)
+if(NOT HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+    message(FATAL_ERROR
+            "URMA headers lack urma_seg_cfg_t::is_gpu_seg, which is required for "
+            "GDR support. Please use a newer UMDK via -DURMA_ROOT pointing to "
+            "a source tree whose urma_api.h/urma_types.h include the is_gpu_seg "
+            "field.")
+endif()
+target_compile_definitions(ub_transport
+        PRIVATE HAVE_URMA_SEG_CFG_IS_GPU_SEG=1)
 target_link_libraries(ub_transport
         PRIVATE
         JsonCpp::JsonCpp
