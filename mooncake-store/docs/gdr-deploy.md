@@ -19,68 +19,46 @@ Measure cross-node GDR transfer from a remote SSD to GPU HBM:
 ### Deployment topology (remote_disk scenario only)
 
 ```
-              Control plane (no KV data)
-        +-------------------------------+
-        | mooncake_master               |
-        |  gRPC :50051  HTTP :8080      |
-        |  metrics :9003                |
-        +---------------+---------------+
-                        |
-        +---------------+---------------+
-        | DATA PLANE                      |
-        |                                |
-  writer (SSD node)               reader (GPU node)
-  role=writer                     role=reader
-  gpu_mode = host (fixed)         gpu_mode = gdr-peermem | staging
-  enable_ssd_offload=true         gpu_device=N
-  global_segment_size (small)     --
-        |                                |
-        +-- SSD (offloaded via evict) --+
-                                         |
-                        reader pulls SSD -> GDR -> GPU HBM
+                  Control plane (no KV data)
+            +-----------------------------------+
+            |           mooncake_master          |
+            |   gRPC :50051   HTTP metadata     |
+            |           metrics :9003           |
+            +-----------------+-----------------+
+                              |
+            +-----------------+-----------------+
+            |              DATA PLANE             |
+            |                                     |
+      writer (SSD node)                reader (GPU node)
+      role = writer                    role = reader
+      write data into SSD              gpu_mode = host | gdr-peermem | staging
+      (as beginning)                   load data from writer to ddr / hbm
+            |                                     |
+            +---------------- SSD ----------------+
 ```
-
-### GDR + SSD datastream (default: pull mode, `MC_OFFLOAD_PUSH` unset)
-
-```
-reader get_into(gpu_buffer)
-  -> RealClient execute_ranged_read (LOCAL_DISK replica)
-  -> batch_get_into_offload_object_internal
-  -> RPC batch_get_offload_object (keys+sizes only) ----> writer
-  writer: file_storage->BatchGet (SSD -> writer DDR)
-  <---- returns pointers + transfer_engine_addr ----
-  reader: submit_batch_get_offload_object
-     TransferRequest::READ, source = reader GPU buffer
-     -> UbTransport::submitTransferTask
-         gdr-peermem : NIC directly DMA GPU HBM (is_gpu_seg=1)
-         staging     : NIC DMA host staging buffer -> cudaMemcpy H2D
-```
-
-Push mode (`export MC_OFFLOAD_PUSH=true`) reverses the final leg: the writer
-issues `urma_write` into the reader's VA instead of the reader issuing
-`urma_read`.
 
 ## 2. Prerequisites
 
-- **UMDK headers** with `urma_seg_cfg_t::is_gpu_seg` field (e.g. the
+- **UMDK user-mode lib** with `urma_seg_cfg_t::is_gpu_seg` field (e.g. the
   `UMDK_tool_netlab` source tree). The build probes this field and aborts
   (FATAL_ERROR) if missing.
+- **UMDK kernel-mode libs** (ubcore / udma driver modules matching the UMDK
+  version).
+- **oe-kernel-6.6.0** with user-defined IOMMU / UMMU to adapt GPU direct access.
+- **CUDA toolkit and GPU driver** — required for `USE_CUDA` builds
+  (`cuMemAlloc`, `cuPointerSetAttribute`, `cudaMemcpy`).
 - **liburma.so** — provide the exact path via `-DURMA_LIBRARY`, or let CMake
   `find_library` search `/usr/lib64 /usr/local/lib64 /usr/lib`. If none is
   found, a mock URMA backend is built (GDR unsupported).
-- **CUDA toolkit** — required for `USE_CUDA` builds (`cuMemAlloc`,
-  `cuPointerSetAttribute`, `cudaMemcpy`).
-- **GPU peermem path** — either the `nvidia_peermem` kernel module, or your
-  custom kernel module that accesses `nvidia.ko` symbols, loaded on the GPU
-  node.
-- **libnuma** — for host buffer allocation.
 
 ## 3. Compilation
 
 ### Configure
 
 ```bash
-cmake -B build \
+cd mooncake-store          # or the repository root
+mkdir build && cd build
+cmake .. \
   -DUSE_UB=ON \
   -DUSE_CUDA=ON \
   -DURMA_ROOT=/path/to/umdk/src/urma/lib/urma \
@@ -98,7 +76,7 @@ cmake -B build \
 ### Build targets
 
 ```bash
-make -C build -j stress_cluster_bench mooncake_master
+make -j stress_cluster_bench mooncake_master
 ```
 
 - `stress_cluster_bench` — the GDR benchmark (reader/writer).
@@ -223,10 +201,10 @@ Tune `global_segment_size` (writer) and `eviction_high_watermark_ratio`
 
 | Env | Behavior |
 |-----|----------|
-| (unset) | pull: reader `urma_read` from writer DDR |
+| `MC_OFFLOAD_PUSH=false` \| unset | pull: reader `urma_read` from writer DDR |
 | `MC_OFFLOAD_PUSH=true` | push: writer `urma_write` into reader VA |
 
-## 6. Logging & Troubleshooting
+## 6. Logging
 
 ### Log levels
 
@@ -238,7 +216,12 @@ Tune `global_segment_size` (writer) and `eviction_high_watermark_ratio`
 
 Hot-path VLOG(2) is counter-sampled (1 per 10000) to avoid flooding.
 
-### Verification: did it really use SSD -> GDR?
+### Verification
+
+By default (`MC_LOG_DIR` unset) all logs go to stderr
+(`FLAGS_logtostderr = true`).  When `MC_LOG_DIR` points to a writable directory,
+glog writes to files under that path (e.g. `stress_cluster_bench.<host>.<user>.
+log.INFO.<date>.<pid>`).
 
 Check the reader breakdown log for the replica type:
 
@@ -246,36 +229,3 @@ Check the reader breakdown log for the replica type:
 - `type[memory_remote]` — data still in memory (eviction did not offload).
   Fix by lowering writer `--global_segment_size` or increasing `--num_keys`,
   then rerun.
-
-### Common issues
-
-| Symptom | Cause / Fix |
-|---------|------------|
-| CMake FATAL_ERROR on `is_gpu_seg` | UMDK too old; point `URMA_ROOT` at a tree with the field |
-| reader `type[memory_remote]` | eviction did not trigger; shrink segment or grow data |
-| `device pointer not registered for staging` | buffer not `register_buffer`'d before transfer |
-| gdr-peermem fails at register | peermem module missing on GPU node |
-| mock URMA warning | `liburma.so` not found; GDR unsupported — set `URMA_LIBRARY` |
-
-## 7. Verification Checklist
-
-**Before launch**
-
-- [ ] `nvidia_peermem` (or your custom ko) loaded on GPU node.
-- [ ] SSD mount (`/mnt/ssd`) writable on SSD node, with enough free space
-      (`>= num_keys * value_size`).
-- [ ] `URMA_ROOT` / `URMA_LIBRARY` resolve to a UMDK tree with `is_gpu_seg`.
-- [ ] Both nodes reachable; master IP/ports correct.
-
-**During run**
-
-- [ ] master log: `enable_offload` active, no startup errors.
-- [ ] writer log: `Offload RPC server started on port ...`, eviction messages,
-      data offloaded to SSD.
-- [ ] reader log: `Set MC_UB_GPU_MODE=gdr-peermem`, GPU buffer allocated.
-
-**After run**
-
-- [ ] reader `type[local_disk_remote]` present in breakdown logs.
-- [ ] `--verify=true` reports `Data verification PASSED`.
-- [ ] No `H2D staging copy failed` / `D2H staging copy failed` errors.
