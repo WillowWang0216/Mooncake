@@ -212,6 +212,34 @@ Tune `global_segment_size` (writer) and `eviction_high_watermark_ratio`
 | `MC_OFFLOAD_PUSH=false` \| unset | pull: reader `urma_read` from writer DDR |
 | `MC_OFFLOAD_PUSH=true` | push: writer `urma_write` into reader VA |
 
+### Recommended values
+
+| Parameter | Recommended | Reason |
+|-----------|-------------|--------|
+| `value_size` | 4194304 (4MB) | Large per-key payload amplifies GDR bandwidth, minimizes metadata overhead |
+| `num_keys` | 2000 | Total 8GB, enough to trigger eviction (> 90% of 1GB segment) |
+| `batch_size` | 1 | Single-key get_into measures pure transfer latency |
+| `num_threads` (reader) | 4 | Concurrent pulls amplify bandwidth; amortize URMA WR overhead |
+| writer `global_segment_size` | 1073741824 (1GB) | 8GB data > 0.9×1GB triggers eviction → data offloaded to SSD |
+| reader `global_segment_size` | 33554432 (32MB) | Reader stores no data; small segment only registers its endpoint |
+| `eviction_high_watermark_ratio` | 0.80 | Accelerates eviction trigger |
+| `wait_seconds` | 120 (both) | Writer: allow offload+eviction to finish; reader: wait for writer prefill |
+
+With the recommended values the hard constraint from [Eviction trigger](#eviction-trigger)
+is satisfied:
+`num_keys * value_size` (2000 * 4MB = 8GB) >
+`eviction_high_watermark_ratio * writer_global_segment_size` (0.80 * 1GB = 800MB).
+
+### Measurement methodology
+
+| Metric | Method |
+|--------|--------|
+| Latency | Each `get_into` timed individually; recorded per-query. Stats: Min/Avg/P50/P90/P99/P999/Max across all queries. |
+| Bandwidth | Cumulative bytes (all threads) / wall time. |
+| Warmup | `--warmup_keys=5` reads excluded from stats; eliminates cold start. |
+| Duration mode | `--duration=N` loops reads until N seconds elapse (continuous throughput). Default (0): single pass over all keys then stop. |
+| Multi-query | Yes — distribution stats from many queries, not single-shot. |
+
 ## 6. Logging
 
 ### Log levels
