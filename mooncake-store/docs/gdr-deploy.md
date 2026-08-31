@@ -53,37 +53,40 @@ Measure cross-node GDR transfer from a remote SSD to GPU HBM:
 
 ## 3. Compilation
 
-### Configure
-
 ```bash
 cd <mooncake-repo-root>    # repository root (where the top-level CMakeLists.txt is)
-mkdir build && cd build
+mkdir -p build && cd build
 cmake .. \
   -DUSE_UB=ON \
   -DUSE_CUDA=ON \
-  -DURMA_ROOT=/path/to/umdk/src/urma/lib/urma \
-  -DURMA_LIBRARY=/path/to/liburma.so \
+  -DUSE_HTTP=ON \
+  -DUSE_ETCD=OFF \
+  -DSTORE_USE_ETCD=OFF \
+  -DWITH_TE=ON \
+  -DWITH_STORE=ON \
+  -DWITH_STORE_RUST=OFF \
+  -DWITH_STORE_GO=OFF \
   -DBUILD_BENCHMARK=ON \
-  -DBUILD_UNIT_TESTS=OFF
+  -DBUILD_UNIT_TESTS=OFF \
+  -DBUILD_EXAMPLES=OFF \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DURMA_ROOT=/path/to/umdk/src/urma/lib/urma \
+  -DURMA_LIBRARY=/path/to/liburma.so
+
+# USE_UB: enable UB protocol transport (required for GDR)
+# USE_CUDA: enable NVIDIA GPU support (cuMemAlloc / cudaMemcpy)
+# URMA_ROOT: UMDK URMA lib dir (core/include + bond/include) for is_gpu_seg probe;
+#            empty falls back to FetchContent
+# URMA_LIBRARY: path to liburma.so file; empty falls back to find_library, then mock
+
+make -j$(nproc) stress_cluster_bench mooncake_master
 ```
 
-- `URMA_ROOT` points at the URMA lib directory containing `core/include/` and
-  `bond/include/`. Empty falls back to FetchContent from atomgit.
-- `URMA_LIBRARY` pins `liburma.so`; empty falls back to `find_library`.
-- The configure step runs `check_cxx_source_compiles` on `is_gpu_seg` and fails
-  hard if the UMDK headers lack it.
-
-### Build targets
-
-```bash
-make -j stress_cluster_bench mooncake_master
-```
-
-- `stress_cluster_bench` — the GDR benchmark (reader/writer).
-- `mooncake_master` — control-plane coordinator + metadata service.
-
-Artifacts land under `build/mooncake-store/benchmarks/` and
-`build/mooncake-store/src/`.
+- Artifacts land under `build/mooncake-store/benchmarks/` and
+  `build/mooncake-store/src/`.
+- The configure step probes `urma_seg_cfg_t::is_gpu_seg` via
+  `check_cxx_source_compiles` and aborts (FATAL_ERROR) if the UMDK headers
+  lack the field. Point `URMA_ROOT` at a tree that has it (e.g. `UMDK_tool_netlab`).
 
 ## 4. Deployment Sequence
 
