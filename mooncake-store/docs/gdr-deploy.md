@@ -54,7 +54,7 @@ Measure cross-node GDR transfer from a remote SSD to GPU HBM:
 ## 3. Compilation
 
 ```bash
-cd <mooncake-repo-root>    # repository root (where the top-level CMakeLists.txt is)
+cd <Mooncake-root>
 mkdir -p build && cd build
 cmake .. \
   -DUSE_UB=ON \
