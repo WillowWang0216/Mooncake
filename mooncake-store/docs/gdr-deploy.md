@@ -140,9 +140,7 @@ stress_cluster_bench \
   `num_keys * value_size > 0.90 * global_segment_size`, so eviction offloads
   data to SSD.
 - Writer uses host buffers only (`--gpu_mode` must be empty/`host`).
-- `</mnt/your-nvme>` must exist and be writable before launch (mount the NVMe
-  SSD and `mkdir -p` it); FileStorage aborts with `std::invalid_argument` if the
-  path is missing.
+- `</mnt/your-nvme>` must exist and be writable before launch.
 
 ### Step 3 — reader (GPU node, after writer finished)
 
