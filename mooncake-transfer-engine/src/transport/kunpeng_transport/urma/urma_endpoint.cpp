@@ -378,8 +378,8 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length,
         .flag = flag,
         .user_ctx = (uintptr_t)NULL,
         .iova = 0,
+        .is_gpu_seg = (type == UbMemoryRegionType::kGpu) ? 1 : 0,
     };
-    seg_cfg.is_gpu_seg = (type == UbMemoryRegionType::kGpu) ? 1 : 0;
     urma_target_seg_t* seg = urma_register_seg(urma_context_, &seg_cfg);
     if (!seg) {
         PLOG(ERROR) << "Failed to register segment " << seg_cfg.va;
@@ -700,11 +700,7 @@ int UrmaContext::poll(int num_entries, Transport::Slice** failed_slices,
             }
             // Safe to publish here — we are done with this slice and do not
             // return it to the caller, so no one else will deref it.
-            if (engine().isStagedSlice(slice)) {
-                engine().onStagedSliceSuccess(slice);
-            } else {
-                slice->markSuccess();
-            }
+            slice->markSuccess();
             continue;
         }
 

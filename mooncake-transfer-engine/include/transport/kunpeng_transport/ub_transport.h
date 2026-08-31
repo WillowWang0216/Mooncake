@@ -115,6 +115,9 @@ class UbTransport : public Transport {
     // Staged READ: defer success until H2D finishes (used by poll path).
     bool shouldDeferSuccess(Slice* slice);
     void onStagedSliceSuccess(Slice* slice);
+    // Final failure path: remove any pending staged-READ mapping (no-op if
+    // the slice is not staged) and mark the slice failed.
+    void onStagedSliceFinalFailure(Slice* slice);
 
    public:
     int onSetupConnections(const HandShakeDesc& peer_desc,

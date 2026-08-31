@@ -173,6 +173,14 @@ void UbTransport::onStagedSliceSuccess(Slice* slice) {
     slice->markSuccess();
 }
 
+void UbTransport::onStagedSliceFinalFailure(Slice* slice) {
+    {
+        std::lock_guard<std::mutex> lock(staged_read_mutex_);
+        staged_read_slices_.erase(slice);
+    }
+    slice->markFailed();
+}
+
 int UbTransport::install(std::string& local_server_name,
                          std::shared_ptr<TransferMetadata> meta,
                          std::shared_ptr<Topology> topo) {
@@ -554,9 +562,9 @@ Status UbTransport::submitTransferTask(
             slice->ub.dst_chip_id = INVALID_CHIP_ID;
             task.slice_list.push_back(slice);
             if (staged_read) {
-                uint64_t offset = static_cast<char*>(slice->source_addr) -
+                uint64_t slice_offset = static_cast<char*>(slice->source_addr) -
                                   static_cast<char*>(effective_source);
-                void* gpu_dst = static_cast<char*>(original_gpu_ptr) + offset;
+                void* gpu_dst = static_cast<char*>(original_gpu_ptr) + slice_offset;
                 std::lock_guard<std::mutex> lock(staged_read_mutex_);
                 staged_read_slices_[slice] = gpu_dst;
                 static std::atomic<uint64_t> staged_read_log_counter{0};

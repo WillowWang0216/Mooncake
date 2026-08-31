@@ -501,11 +501,7 @@ void UbWorkerPool::performPoll(int thread_id) {
             auto ptr = static_cast<UbEndPoint*>(slice->ub.endpoint);
             context_.deleteEndpointByPtr(ptr);
         }
-        if (context_.engine().isStagedSlice(slice)) {
-            context_.engine().onStagedSliceFinalFailure(slice);
-        } else {
-            slice->markFailed();
-        }
+        context_.engine().onStagedSliceFinalFailure(slice);
         processed_slice_count_++;
     }
 
