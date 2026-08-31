@@ -80,10 +80,12 @@ cmake .. \
 # URMA_LIBRARY: path to liburma.so file; empty falls back to find_library, then mock
 
 make -j$(nproc) stress_cluster_bench mooncake_master
+
+# Build artifact locations:
+# build/mooncake-store/benchmarks/stress_cluster_bench
+# build/mooncake-store/src/mooncake_master
 ```
 
-- Artifacts land under `build/mooncake-store/benchmarks/` and
-  `build/mooncake-store/src/`.
 - The configure step probes `urma_seg_cfg_t::is_gpu_seg` via
   `check_cxx_source_compiles` and aborts (FATAL_ERROR) if the UMDK headers
   lack the field. Point `URMA_ROOT` at a tree that has it (e.g. `UMDK_tool_netlab`).
