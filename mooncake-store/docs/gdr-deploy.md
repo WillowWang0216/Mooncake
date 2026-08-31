@@ -88,7 +88,7 @@ make -j$(nproc) stress_cluster_bench mooncake_master
   `check_cxx_source_compiles` and aborts (FATAL_ERROR) if the UMDK headers
   lack the field. Point `URMA_ROOT` at a tree that has it (e.g. `UMDK_tool_netlab`).
 
-## 4. Deployment Sequence
+## 4. Deployment
 
 Start in order: master -> writer -> reader. The writer must finish prefill +
 offload before the reader starts.
@@ -140,6 +140,9 @@ stress_cluster_bench \
 ### Step 3 — reader (GPU node, after writer finished)
 
 ```bash
+# MC_OFFLOAD_PUSH=true: push mode (writer urma_write into reader VA).
+# Unset or =false: pull mode (reader urma_read from writer DDR, default).
+MC_OFFLOAD_PUSH=true \
 stress_cluster_bench \
   --scenario=remote_disk \
   --role=reader \
