@@ -19,22 +19,24 @@ Measure cross-node GDR transfer from a remote SSD to GPU HBM:
 ### Deployment topology (remote_disk scenario only)
 
 ```
-                  Control plane (no KV data)
-            +-----------------------------------+
-            |           mooncake_master          |
-            |   gRPC :50051   HTTP metadata     |
-            |           metrics :9003           |
-            +-----------------+-----------------+
-                              |
-            +-----------------+-----------------+
-            |              DATA PLANE             |
-            |                                     |
-      writer (SSD node)                reader (GPU node)
-      role = writer                    role = reader
-      write data into SSD              gpu_mode = host | gdr-peermem | staging
-      (as beginning)                   load data from writer to ddr / hbm
-            |                                     |
-            +---------------- SSD ----------------+
+                              Control plane (no KV data)
+                         +-----------------------------+
+                         |       mooncake_master       |
+                         | gRPC :50051   HTTP metadata |
+                         |        metrics :9003        |
+                         +--------------+--------------+
+                                        |
+                           +------------+------------+
+                           |        DATA PLANE       |
+                           |                         |
+               +-----------------------+    +-----------------------+
+               | writer (SSD node)     |    | reader (GPU node)     |
+               | role = writer         |    | role = reader         |
+               | write data into SSD   |    | gpu_mode =            |
+               | (as beginning)        |    |   staging|gdr-peermem |
+               +-----------------------+    +-----------------------+
+                           |                         |
+                           +------------+------------+
 ```
 
 ## 2. Prerequisites
