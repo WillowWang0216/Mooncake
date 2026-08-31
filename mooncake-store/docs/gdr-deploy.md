@@ -219,16 +219,46 @@ Tune `global_segment_size` (writer) and `eviction_high_watermark_ratio`
 
 Hot-path VLOG(2) is counter-sampled (1 per 10000) to avoid flooding.
 
-### Verification
-
 By default (`MC_LOG_DIR` unset) all logs go to stderr
 (`FLAGS_logtostderr = true`).  When `MC_LOG_DIR` points to a writable directory,
 glog writes to files under that path (e.g. `stress_cluster_bench.<host>.<user>.
-log.INFO.<date>.<pid>`).
+log.INFO.<date>.<pid>` for the reader, `mooncake_master.<host>.<user>.
+log.INFO.<date>.<pid>` for the master).
 
-Check the reader breakdown log for the replica type:
+## 7. Verification
 
-- `type[local_disk_remote]` — correct: SSD -> GDR path active.
-- `type[memory_remote]` — data still in memory (eviction did not offload).
-  Fix by lowering writer `--global_segment_size` or increasing `--num_keys`,
-  then rerun.
+The checks below confirm the full data path behaved as expected. Master
+startup is out of scope (it is not part of the data path).
+
+### 1. Writer: data written and offloaded to SSD correctly
+
+- `Write complete: N succeeded, M failed` — `N` must equal `--num_keys`.
+- Master log `[EVICT-TRIGGER] memory_ratio=...` — eviction fired.
+- Writer log `Offload RPC server started on port ...` — offload service up.
+- **Mixed-state check**: if the reader's replica_type shows both
+  `memory_remote` and `local_disk_remote`, part of the data is still in DRAM and
+  the measurement is not a pure GPU<->SSD link test. Ideally all reads report
+  `local_disk_remote`. Fix by shrinking writer `--global_segment_size` or
+  increasing `--num_keys`, then rerun.
+
+### 2. Reader: correct path and urma direction
+
+- `GPU mode: gdr-peermem` (stdout) and `Set MC_UB_GPU_MODE=gdr-peermem` (log)
+  confirm the selected GPU path.
+- `offload_read_breakdown mode=push` (urma_write) or `mode=pull` (urma_read)
+  confirms the transfer direction.
+
+### 3. Reader: pull succeeded, from SSD, correct volume
+
+- `Total keys: N` — `N` must equal `--num_keys`.
+- `Total data: X` — must equal `num_keys * value_size`.
+- `failed: 0`.
+- Replica type is `local_disk_remote` — data was read from SSD.
+- `--verify=true` reports `Data verification PASSED`.
+
+### 4. Reader: performance stats
+
+The `READ BENCHMARK [remote_disk]` block on stdout reports:
+
+- `Throughput: X MB/s (Y GB/s)` — bandwidth.
+- `Latency (us)`: Avg / P50 / P90 / P99 — per-query latency.
