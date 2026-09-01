@@ -156,6 +156,8 @@ NUM_KEYS=2048                # total keys (must match writer)
 # --- Reader tuning (adjust per test scenario, see Recommended values) ---
 BATCH_SIZE=1                 # 1 for latency; 32/64/128/+ for bandwidth
 NUM_THREADS=1                # 1 for latency; 4/8/16 for bandwidth (binds to NUMA nodes)
+GPU_MODE=gdr-peermem         # gdr-peermem | staging (reader GPU link mode; empty=host)
+GPU_DEVICE=0                 # CUDA device index
 
 # MC_OFFLOAD_PUSH=true: push mode (writer urma_write into reader VA).
 # Unset or =false: pull mode (reader urma_read from writer DDR, default).
@@ -165,8 +167,8 @@ stress_cluster_bench \
   --role=reader \
   --protocol=ub \
   --device_name=bonding_dev_0 \
-  --gpu_mode=gdr-peermem \
-  --gpu_device=0 \
+  --gpu_mode=${GPU_MODE} \
+  --gpu_device=${GPU_DEVICE} \
   --local_hostname=<GPU_NODE_IP>:12346 \
   --metadata_server=http://<MASTER_IP>:8080/metadata \
   --master_server=<MASTER_IP>:50051 \
