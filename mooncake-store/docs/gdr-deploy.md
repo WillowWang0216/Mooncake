@@ -173,6 +173,7 @@ stress_cluster_bench \
   --metadata_server=http://<MASTER_IP>:8080/metadata \
   --master_server=<MASTER_IP>:50051 \
   --global_segment_size=33554432 \
+  --local_buffer_size=0 \
   --value_size=${VALUE_SIZE} \
   --num_keys=${NUM_KEYS} \
   --batch_size=${BATCH_SIZE} \
