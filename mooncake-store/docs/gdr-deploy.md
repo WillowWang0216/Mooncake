@@ -109,13 +109,20 @@ mooncake_master \
   --http_metadata_server_port=8080 \
   --enable_offload=true \
   --offload_on_evict=true \
-  --eviction_high_watermark_ratio=0.80 \
+  --eviction_high_watermark_ratio=0.01 \
+  --eviction_ratio=0.00 \
   --logtostderr=true
 ```
 
 ### Step 2 — writer (SSD node)
 
 ```bash
+# --- Workload parameters (writer and reader MUST use the same values) ---
+VALUE_SIZE=4194304           # 4MB per key
+NUM_KEYS=2048                # total keys
+# writer global_segment_size = VALUE_SIZE * NUM_KEYS (8GB) — large enough to hold all data
+SEGMENT_SIZE=$((VALUE_SIZE * NUM_KEYS))
+
 stress_cluster_bench \
   --scenario=remote_disk \
   --role=writer \
@@ -124,27 +131,32 @@ stress_cluster_bench \
   --local_hostname=<SSD_NODE_IP>:12345 \
   --metadata_server=http://<MASTER_IP>:8080/metadata \
   --master_server=<MASTER_IP>:50051 \
-  --global_segment_size=1073741824 \
-  --local_buffer_size=536870912 \
-  --value_size=4194304 \
-  --num_keys=2000 \
+  --global_segment_size=${SEGMENT_SIZE} \
+  --local_buffer_size=0 \
+  --value_size=${VALUE_SIZE} \
+  --num_keys=${NUM_KEYS} \
   --batch_size=1 \
   --replica_num=1 \
   --enable_ssd_offload=true \
   --ssd_offload_path=</mnt/your-nvme> \
-  --wait_seconds=120 \
+  --wait_seconds=300 \
   --logtostderr=true
 ```
 
-- `global_segment_size` must be small enough that
-  `num_keys * value_size > 0.90 * global_segment_size`, so eviction offloads
-  data to SSD.
 - Writer uses host buffers only (`--gpu_mode` must be empty/`host`).
 - `</mnt/your-nvme>` must exist and be writable before launch.
 
 ### Step 3 — reader (GPU node, after writer finished)
 
 ```bash
+# --- Workload parameters (MUST match writer's VALUE_SIZE and NUM_KEYS) ---
+VALUE_SIZE=4194304           # 4MB per key (must match writer)
+NUM_KEYS=2048                # total keys (must match writer)
+
+# --- Reader tuning (adjust per test scenario, see Recommended values) ---
+BATCH_SIZE=1                 # 1 for latency; 32/64/128/+ for bandwidth
+NUM_THREADS=1                # 1 for latency; 4/8/16 for bandwidth (binds to NUMA nodes)
+
 # MC_OFFLOAD_PUSH=true: push mode (writer urma_write into reader VA).
 # Unset or =false: pull mode (reader urma_read from writer DDR, default).
 MC_OFFLOAD_PUSH=true \
@@ -159,11 +171,11 @@ stress_cluster_bench \
   --metadata_server=http://<MASTER_IP>:8080/metadata \
   --master_server=<MASTER_IP>:50051 \
   --global_segment_size=33554432 \
-  --value_size=4194304 \
-  --num_keys=2000 \
-  --batch_size=1 \
-  --num_threads=4 \
-  --wait_seconds=120 \
+  --value_size=${VALUE_SIZE} \
+  --num_keys=${NUM_KEYS} \
+  --batch_size=${BATCH_SIZE} \
+  --num_threads=${NUM_THREADS} \
+  --wait_seconds=10 \
   --verify=true \
   --logtostderr=true
 ```
@@ -205,8 +217,9 @@ Gpu mode behavior:
 
 Offload to SSD happens when
 `num_keys * value_size > eviction_high_watermark_ratio * global_segment_size`.
-Tune `global_segment_size` (writer) and `eviction_high_watermark_ratio`
-(master, default 0.90) accordingly.
+With `eviction_high_watermark_ratio=0.01`, eviction triggers at 1% of segment —
+essentially immediately. Combined with `eviction_ratio=0.00`, the master
+aggressively offloads all data to SSD and removes MEMORY replicas.
 
 ### Push vs pull
 
@@ -217,21 +230,39 @@ Tune `global_segment_size` (writer) and `eviction_high_watermark_ratio`
 
 ### Recommended values
 
-| Parameter | Recommended | Reason |
-|-----------|-------------|--------|
-| `value_size` | 4194304 (4MB) | Large per-key payload amplifies GDR bandwidth, minimizes metadata overhead |
-| `num_keys` | 2000 | Total 8GB, enough to trigger eviction (> 90% of 1GB segment) |
-| `batch_size` | 1 | Single-key get_into measures pure transfer latency |
-| `num_threads` (reader) | 4 | Concurrent pulls amplify bandwidth; amortize URMA WR overhead |
-| writer `global_segment_size` | 1073741824 (1GB) | 8GB data > 0.9×1GB triggers eviction → data offloaded to SSD |
-| reader `global_segment_size` | 33554432 (32MB) | Reader stores no data; small segment only registers its endpoint |
-| `eviction_high_watermark_ratio` | 0.80 | Accelerates eviction trigger |
-| `wait_seconds` | 120 (both) | Writer: allow offload+eviction to finish; reader: wait for writer prefill |
+#### Workload parameters (writer + reader must match)
 
-With the recommended values the hard constraint from [Eviction trigger](#eviction-trigger)
-is satisfied:
-`num_keys * value_size` (2000 * 4MB = 8GB) >
-`eviction_high_watermark_ratio * writer_global_segment_size` (0.80 * 1GB = 800MB).
+| Env | Default | Notes |
+|-----|---------|-------|
+| `VALUE_SIZE` | 4194304 (4MB) | Per-key payload. Writer and reader MUST use the same value. |
+| `NUM_KEYS` | 2048 | Total keys. Writer and reader MUST use the same value. Total data = `VALUE_SIZE * NUM_KEYS` (8GB default). |
+| `SEGMENT_SIZE` | `VALUE_SIZE * NUM_KEYS` | Writer segment = total data size. Computed automatically. |
+
+#### Master eviction
+
+| Flag | Value | Reason |
+|------|-------|--------|
+| `eviction_high_watermark_ratio` | 0.01 | Trigger eviction almost immediately (1% of segment) |
+| `eviction_ratio` | 0.00 | Evict everything possible (target 0% memory) |
+
+#### Reader tuning per test scenario
+
+| Scenario | `BATCH_SIZE` | `NUM_THREADS` | GPU HBM | Notes |
+|----------|-------------|---------------|---------|-------|
+| Latency | 1 | 1 | 8MB | Single-key, single-thread: pure per-query latency |
+| Bandwidth | 32/64/128/+ | 4/8/16 | varies | Batch reads fill URMA pipeline; threads bind NUMA nodes |
+
+GPU HBM = `(1 + NUM_THREADS) * BATCH_SIZE * VALUE_SIZE`
+
+#### NUMA binding
+
+Reader threads are automatically pinned to NUMA nodes round-robin
+(`bindToSocket(t % NR_SOCKETS)`). With 4 NUMA nodes:
+- `NUM_THREADS=4` → each thread on a distinct NUMA (optimal)
+- `NUM_THREADS=1` → only NUMA 0 used
+
+Staging-mode host buffers follow the same NUMA binding. GDR (gdr-peermem)
+GPU HBM is not NUMA-bound (device memory is globally accessible).
 
 ### Measurement methodology
 
