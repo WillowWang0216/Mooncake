@@ -1116,6 +1116,9 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys, const std::string& tenant_id) {
+    SpDiag::PerfPoint pt(PerfKey::CLIENT_BATCH_QUERY,
+                         SpDiag::PerfLevel::MODULE);
+    pt.Start();
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
     auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
@@ -1130,6 +1133,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
         for (size_t i = 0; i < object_keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
         }
+        pt.End(-1);
         return results;
     }
     std::vector<tl::expected<QueryResult, ErrorCode>> results;
@@ -1145,6 +1149,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
             results.emplace_back(tl::unexpected(response[i].error()));
         }
     }
+    pt.End(0);
     return results;
 }
 
@@ -1693,6 +1698,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
+            pt_full.End(-1);
             return tl::unexpected(checksum_result.error());
         }
         object_checksum = *checksum_result;
@@ -1719,6 +1725,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "object_already_exists key=" << key;
+            pt_full.End(0);
             return {};
         }
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
@@ -1728,6 +1735,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             LOG(ERROR) << "Failed to start put operation for key=" << key
                        << ": " << toString(err);
         }
+        pt_full.End(-1);
         return tl::unexpected(err);
     }
 
@@ -1789,6 +1797,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
+            pt_full.End(-1);
             return tl::unexpected(err);
         }
     }
@@ -1798,14 +1807,17 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             master_client_.PutRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
+            pt_full.End(-1);
             return tl::unexpected(revoke_result.error());
         }
     }
 
     if (!finalize_decision.success) {
+        pt_full.End(-1);
         return tl::unexpected(finalize_decision.error);
     }
 
+    pt_full.End(0);
     return {};
 }
 
@@ -2138,8 +2150,14 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
             op.SetError(ErrorCode::RPC_FAIL,
                         "BatchPutStart response size mismatch");
         }
+        pt_batch_start.End(-1);
         return;
     }
+
+    const bool any_start_succeeded =
+        std::any_of(start_responses.begin(), start_responses.end(),
+                    [](const auto& response) { return response.has_value(); });
+    pt_batch_start.End(any_start_succeeded ? 0 : -1);
 
     // Process individual responses with robust error handling
     for (size_t i = 0; i < active_indices.size(); ++i) {
@@ -2828,17 +2846,24 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         if (client_cfg.nof_replica_num > 0) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
                           "NoF replicas";
+            pt_full.End(-1);
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
         if (client_cfg.replica_num != 1) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
                           "replica_num != 1";
+            pt_full.End(-1);
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
         StartBatchPut(ops, client_cfg);
-        return BatchPutWhenPreferSameNode(ops);
+        auto results = BatchPutWhenPreferSameNode(ops);
+        const bool any_succeeded =
+            std::any_of(results.begin(), results.end(),
+                        [](const auto& result) { return result.has_value(); });
+        pt_full.End(any_succeeded ? 0 : -1);
+        return results;
     }
     StartBatchPut(ops, client_cfg);
 
@@ -2853,7 +2878,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
 
     FinalizeBatchPut(ops);
-    return CollectResults(ops);
+    auto results = CollectResults(ops);
+    const bool any_succeeded =
+        std::any_of(results.begin(), results.end(),
+                    [](const auto& result) { return result.has_value(); });
+    pt_full.End(any_succeeded ? 0 : -1);
+    return results;
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
@@ -3478,6 +3508,16 @@ tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     }
     promotion_objects = std::move(response.value());
     return {};
+}
+
+tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+Client::RemoveObjectHeartbeat(const UUID& client_id) {
+    return master_client_.RemoveObjectHeartbeat(client_id);
+}
+
+tl::expected<void, ErrorCode> Client::AckRemoveObjectHeartbeat(
+    const UUID& client_id, const std::vector<RemoveTaskItem>& tasks) {
+    return master_client_.AckRemoveObjectHeartbeat(client_id, tasks);
 }
 
 tl::expected<PromotionAllocStartResponse, ErrorCode>
