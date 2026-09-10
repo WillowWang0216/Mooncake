@@ -72,6 +72,9 @@ cmake .. \
   -DBUILD_UNIT_TESTS=OFF \
   -DBUILD_EXAMPLES=OFF \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_SKIP_RPATH=ON \
+  -DCMAKE_BUILD_RPATH="" \
+  -DCMAKE_INSTALL_RPATH="" \
   -DURMA_ROOT=/path/to/umdk/src/urma/lib/urma \
   -DURMA_LIBRARY=/path/to/liburma.so
 
@@ -80,12 +83,15 @@ cmake .. \
 # URMA_ROOT: UMDK URMA lib dir (core/include + bond/include) for is_gpu_seg probe;
 #            empty falls back to FetchContent
 # URMA_LIBRARY: path to liburma.so file; empty falls back to find_library, then mock
+# CMAKE_SKIP_RPATH=ON: disable RPATH so the binary relies on LD_LIBRARY_PATH for
+#                      shared library resolution (prevents stale build-machine paths)
 
-make -j$(nproc) stress_cluster_bench mooncake_master
+make -j$(nproc) stress_cluster_bench mooncake_master mooncake_client
 
 # Build artifact locations:
 # build/mooncake-store/benchmarks/stress_cluster_bench
 # build/mooncake-store/src/mooncake_master
+# build/mooncake-store/src/mooncake_client
 ```
 
 - The configure step probes `urma_seg_cfg_t::is_gpu_seg` via
