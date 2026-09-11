@@ -528,6 +528,12 @@ class StressBenchmark {
 
     int Setup() {
         gpu_config_ = ResolveGpuConfig();
+        if (gpu_config_.mode == "gdr-peermem" && FLAGS_global_segment_size > 0) {
+            LOG(INFO) << "gdr-peermem mode: forcing global_segment_size=0 "
+                      << "(host segment not needed, GPU buffer registered "
+                      << "separately)";
+            FLAGS_global_segment_size = 0;
+        }
         int ret = client_->setup_real(
             FLAGS_local_hostname, FLAGS_metadata_server,
             FLAGS_global_segment_size, FLAGS_local_buffer_size, FLAGS_protocol,
