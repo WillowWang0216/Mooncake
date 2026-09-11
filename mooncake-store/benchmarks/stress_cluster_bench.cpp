@@ -399,14 +399,24 @@ class BenchmarkStats {
                   << "========================================\n";
         std::cout << std::fixed << std::setprecision(2);
 
+        std::cout << "  Parameters:\n";
+        std::cout << "    Scenario:       " << FLAGS_scenario << "\n";
+        std::cout << "    Protocol:       " << FLAGS_protocol << "\n";
+        std::cout << "    GPU mode:       " << FLAGS_gpu_mode << "\n";
+        std::cout << "    GPU device:     " << FLAGS_gpu_device << "\n";
+        std::cout << "    Value size:     " << FLAGS_value_size / MB << " MB\n";
+        std::cout << "    Batch size:     " << FLAGS_batch_size << "\n";
+        std::cout << "    Num threads:    " << FLAGS_num_threads << "\n";
+        std::cout << "    Num keys:       " << FLAGS_num_keys << "\n";
+
         double wall = WallSeconds();
-        std::cout << "  Wall time:        " << wall << " s\n";
+        std::cout << "\n  Total time:        " << wall << " s\n";
         std::cout << "  Total queries:    " << total_queries_
                   << " (failed: " << total_failed_ << ")\n";
         std::cout << "  Total keys:       " << total_keys_ << "\n";
         std::cout << "  Total data:       " << FormatBytes(total_bytes_)
                   << "\n";
-        std::cout << "  Throughput:       " << ThroughputMBps() << " MB/s";
+        std::cout << "  Throughput (avg): " << ThroughputMBps() << " MB/s";
         if (ThroughputMBps() > 1024) {
             std::cout << " (" << ThroughputMBps() / 1024 << " GB/s)";
         }
@@ -430,6 +440,9 @@ class BenchmarkStats {
             std::cout << "\n";
             std::cout << "    P999:  " << std::setw(12) << PercentileUs(99.9);
             if (n < 1000) std::cout << "  (n<1000)";
+            std::cout << "\n";
+            std::cout << "    P9999: " << std::setw(12) << PercentileUs(99.99);
+            if (n < 10000) std::cout << "  (n<10000)";
             std::cout << "\n";
             std::cout << "    Max:   " << std::setw(12)
                       << NanosToUs(merged_latencies_ns_.back()) << "\n";
@@ -1326,20 +1339,40 @@ class StressBenchmark {
             !interval_stats_list.empty()
                 ? overall.throughput_mbps / interval_stats_list.size()
                 : 0;
+        double peak_throughput_mbps = 0;
+        for (const auto& stats : interval_stats_list) {
+            peak_throughput_mbps =
+                std::max(peak_throughput_mbps, stats.throughput_mbps);
+        }
+        double cur_throughput_mbps =
+            !interval_stats_list.empty()
+                ? interval_stats_list.back().throughput_mbps
+                : 0;
         size_t total_latency_samples = overall.total_samples;
 
         std::cout << "\n  FINAL SUMMARY\n";
-        std::cout << "  Total time:       " << total_sec << " s\n";
+        std::cout << "  Parameters:\n";
+        std::cout << "    Scenario:       " << FLAGS_scenario << "\n";
+        std::cout << "    Protocol:       " << FLAGS_protocol << "\n";
+        std::cout << "    GPU mode:       " << FLAGS_gpu_mode << "\n";
+        std::cout << "    GPU device:     " << FLAGS_gpu_device << "\n";
+        std::cout << "    Value size:     " << FLAGS_value_size / MB << " MB\n";
+        std::cout << "    Batch size:     " << FLAGS_batch_size << "\n";
+        std::cout << "    Num threads:    " << FLAGS_num_threads << "\n";
+        std::cout << "    Num keys:       " << FLAGS_num_keys << "\n";
+
+        std::cout << "\n  Total time:       " << total_sec << " s\n";
         std::cout << "  Total queries:    " << final_queries
                   << " (failed: " << final_failed << ")\n";
         std::cout << "  Total keys:       " << final_keys << "\n";
         std::cout << "  Total data:       " << FormatBytes(final_bytes) << "\n";
-        std::cout << "  Throughput:       " << final_throughput_mbps
-                  << " MB/s (avg: " << avg_throughput_mbps << " MB/s)";
+        std::cout << "  Throughput (peak): " << peak_throughput_mbps << " MB/s\n";
+        std::cout << "  Throughput (avg):  " << final_throughput_mbps << " MB/s";
         if (final_throughput_mbps > 1024) {
             std::cout << " (" << final_throughput_mbps / 1024 << " GB/s)";
         }
         std::cout << "\n";
+        std::cout << "  Throughput (cur):  " << cur_throughput_mbps << " MB/s\n";
         std::cout << "  Keys/sec:         " << final_keys_per_sec << "\n";
         std::cout << "  Queries/sec:      " << final_queries_per_sec << "\n";
 
