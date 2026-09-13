@@ -482,9 +482,14 @@ class StressBenchmark {
         }
 
         // Unregister and free thread buffers (these are allocated by this
-        // class)
+        // class). In gdr-peermem mode the thread buffers are sub-regions of the
+        // single GPU HBM block owned by buffer_, so they are skipped here.
         for (auto& tb : thread_buffers_) {
             if (tb.ptr) {
+                if (gpu_config_.mode == "gdr-peermem") {
+                    tb.ptr = nullptr;
+                    continue;
+                }
                 try {
                     client_->unregister_buffer(tb.ptr);
                 } catch (...) {
@@ -549,18 +554,23 @@ class StressBenchmark {
         buffer_size_ = FLAGS_batch_size * FLAGS_value_size;
         if (gpu_config_.use_gpu_buffer) {
 #if defined(USE_CUDA) && defined(USE_UB)
+            size_t gpu_alloc_size = buffer_size_;
+            if (gpu_config_.mode == "gdr-peermem") {
+                gpu_alloc_size = (1 + FLAGS_num_threads) * buffer_size_;
+            }
             buffer_ = reinterpret_cast<char*>(
-                mooncake::ub_allocate_gpu_hbm(buffer_size_,
+                mooncake::ub_allocate_gpu_hbm(gpu_alloc_size,
                                               FLAGS_gpu_device));
             if (!buffer_) {
                 LOG(ERROR) << "Failed to allocate GPU buffer of "
-                           << buffer_size_ << " bytes";
+                           << gpu_alloc_size << " bytes";
                 return -1;
             }
             buffer_is_gpu_ = true;
             VLOG(1) << "[bench] GPU buffer allocated mode="
                     << gpu_config_.mode << " device=" << FLAGS_gpu_device
-                    << " addr=" << buffer_ << " size=" << buffer_size_
+                    << " addr=" << buffer_ << " alloc_size=" << gpu_alloc_size
+                    << " buf_size=" << buffer_size_
                     << " is_gpu=" << buffer_is_gpu_;
 #else
             LOG(FATAL) << "gpu_mode requires USE_CUDA and USE_UB build";
@@ -576,7 +586,13 @@ class StressBenchmark {
             std::memset(buffer_, 0, buffer_size_);
         }
 
-        ret = client_->register_buffer(buffer_, buffer_size_);
+        {
+            size_t register_size = buffer_size_;
+            if (gpu_config_.mode == "gdr-peermem") {
+                register_size = (1 + FLAGS_num_threads) * buffer_size_;
+            }
+            ret = client_->register_buffer(buffer_, register_size);
+        }
         if (ret != 0) {
             LOG(ERROR) << "register_buffer failed, ret=" << ret;
             return ret;
@@ -1952,9 +1968,13 @@ class StressBenchmark {
             thread_buffers_[t].is_gpu = gpu_config_.use_gpu_buffer;
             if (gpu_config_.use_gpu_buffer) {
 #if defined(USE_CUDA) && defined(USE_UB)
-                thread_buffers_[t].ptr = reinterpret_cast<char*>(
-                    mooncake::ub_allocate_gpu_hbm(per_buf_size,
-                                                  FLAGS_gpu_device));
+                if (gpu_config_.mode == "gdr-peermem") {
+                    thread_buffers_[t].ptr = buffer_ + (1 + t) * per_buf_size;
+                } else {
+                    thread_buffers_[t].ptr = reinterpret_cast<char*>(
+                        mooncake::ub_allocate_gpu_hbm(per_buf_size,
+                                                      FLAGS_gpu_device));
+                }
                 if (!thread_buffers_[t].ptr) {
                     LOG(ERROR) << "Failed to allocate GPU buffer for thread "
                                << t << " size=" << per_buf_size;
@@ -1973,12 +1993,18 @@ class StressBenchmark {
                 }
                 std::memset(thread_buffers_[t].ptr, 0, per_buf_size);
             }
-            int ret =
-                client_->register_buffer(thread_buffers_[t].ptr, per_buf_size);
-            if (ret != 0) {
-                LOG(ERROR) << "register_buffer failed for thread " << t
-                           << " on NUMA node " << node;
-                return ret;
+            if (gpu_config_.mode == "gdr-peermem") {
+                VLOG(1) << "[bench] gdr-peermem thread buffer " << t
+                        << " -> main GPU block offset "
+                        << (1 + t) * per_buf_size;
+            } else {
+                int ret = client_->register_buffer(thread_buffers_[t].ptr,
+                                                   per_buf_size);
+                if (ret != 0) {
+                    LOG(ERROR) << "register_buffer failed for thread " << t
+                               << " on NUMA node " << node;
+                    return ret;
+                }
             }
         }
         LOG(INFO) << "Allocated " << num_threads << " thread buffers, each "
