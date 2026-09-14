@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <memory>
 #include <string>
@@ -100,9 +101,10 @@ class UbTransport : public Transport {
    private:
     int allocateLocalSegmentID();
 
-    // Per-buffer staging mapping: GPU VA -> its dedicated host staging buffer
+    // Per-buffer staging mapping: GPU VA range -> its dedicated host staging buffer
     // (registered with URMA so the NIC can DMA it). Used only in kStaging mode.
     struct StagingMapping {
+        void* gpu_base = nullptr;
         void* host_ptr = nullptr;
         size_t size = 0;
     };
@@ -159,7 +161,7 @@ class UbTransport : public Transport {
     mutable std::once_flag gpu_mode_once_;
     mutable UbGpuMode gpu_mode_ = UbGpuMode::kStaging;
     std::mutex staging_map_mutex_;
-    std::unordered_map<void*, StagingMapping> staging_map_;  // GPU_VA -> host staging
+    std::map<void*, StagingMapping> staging_map_;  // GPU_VA -> host staging, ordered for range lookup
     std::mutex staged_read_mutex_;
     // Slice -> original GPU VA for staged READ H2D completion.
     std::unordered_map<Slice*, void*> staged_read_slices_;

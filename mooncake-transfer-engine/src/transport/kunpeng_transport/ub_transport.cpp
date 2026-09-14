@@ -261,7 +261,7 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
                     return ret;
                 }
                 std::lock_guard<std::mutex> lock(staging_map_mutex_);
-                staging_map_[addr] = {host, length};
+                staging_map_[addr] = {addr, host, length};
                 VLOG(1) << "[ub_staging] mapped gpu_va=" << addr
                         << " -> host=" << host << " len=" << length;
                 return 0;
@@ -480,23 +480,35 @@ Status UbTransport::submitTransferTask(
                     "UbTransport: device pointer is not allowed in host mode");
             }
             // kStaging: route through the per-buffer host staging buffer.
+            // The GPU VA may point into the middle of a registered region
+            // (e.g. batch reads use base + k*value_size), so do a range lookup
+            // and preserve the intra-region offset in the host mapping.
             StagingMapping m;
             {
                 std::lock_guard<std::mutex> lock(staging_map_mutex_);
-                auto it = staging_map_.find(request.source);
-                if (it == staging_map_.end()) {
+                auto it = staging_map_.upper_bound(request.source);
+                if (it != staging_map_.begin()) {
+                    --it;
+                    m = it->second;
+                }
+                if (!m.gpu_base || request.source < m.gpu_base ||
+                    reinterpret_cast<char*>(request.source) >=
+                        reinterpret_cast<char*>(m.gpu_base) + m.size) {
                     return Status::AddressNotRegistered(
                         "UbTransport: device pointer is not registered for "
                         "staging, address: " +
                         std::to_string(
                             reinterpret_cast<uintptr_t>(request.source)));
                 }
-                m = it->second;
             }
-            effective_source = m.host_ptr;
+            const size_t staging_offset =
+                reinterpret_cast<char*>(request.source) -
+                reinterpret_cast<char*>(m.gpu_base);
+            effective_source =
+                reinterpret_cast<char*>(m.host_ptr) + staging_offset;
             original_gpu_ptr = request.source;
             if (request.opcode == TransferRequest::WRITE) {
-                if (!copyDeviceToHost(m.host_ptr, request.source,
+                if (!copyDeviceToHost(effective_source, request.source,
                                       request.length)) {
                     LOG(ERROR)
                         << "UbTransport: D2H staging copy failed for WRITE, "
@@ -507,9 +519,9 @@ Status UbTransport::submitTransferTask(
                 }
                 if (VLOG_IS_ON(2) && submit_log_counter.load(
                         std::memory_order_relaxed) % kSubmitLogSampleInterval == 0) {
-                    VLOG(2) << "[ub_staging] D2H done gpu=" << request.source
-                            << " -> host=" << m.host_ptr
-                            << " len=" << request.length;
+VLOG(2) << "[ub_staging] D2H done gpu=" << request.source
+                        << " -> host=" << effective_source
+                        << " len=" << request.length;
                 }
             } else {
                 staged_read = true;  // defer success until H2D
