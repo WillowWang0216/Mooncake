@@ -61,6 +61,7 @@ mkdir -p build && cd build
 cmake .. \
   -DUSE_UB=ON \
   -DUSE_CUDA=ON \
+  -DUSE_URING=ON \
   -DUSE_HTTP=ON \
   -DUSE_ETCD=OFF \
   -DSTORE_USE_ETCD=OFF \
@@ -80,6 +81,10 @@ cmake .. \
 
 # USE_UB: enable UB protocol transport (required for GDR)
 # USE_CUDA: enable NVIDIA GPU support (cuMemAlloc / cudaMemcpy)
+# USE_URING: enable io_uring-based async file I/O with O_DIRECT (bypasses OS
+#            page cache); strongly recommended when the SSD offload path is
+#            backed by NVMe (Gen4/Gen5). Without this flag the writer falls
+#            back to synchronous preadv, which limits SSD read throughput.
 # URMA_ROOT: UMDK URMA lib dir (core/include + bond/include) for is_gpu_seg probe;
 #            empty falls back to FetchContent
 # URMA_LIBRARY: path to liburma.so file; empty falls back to find_library, then mock
@@ -122,6 +127,17 @@ mooncake_master \
 
 ### Step 2 — writer (SSD node)
 
+The writer allocates a FileStorage `ClientBuffer` for SSD read staging (default 1.25 GiB,
+configurable via `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`). With batch- or
+multi-thread reads the default may cause `BUFFER_OVERFLOW`; set it to at least
+`(1 + num_threads) × batch_size × value_size`, or larger.
+
+io_uring (`MOONCAKE_OFFLOAD_USE_URING=true`) is **strongly recommended** when
+the SSD offload path is backed by NVMe. It enables O_DIRECT (bypasses the OS
+page cache) and allows the FileStorage backend to submit multiple I/Os in a
+single io_uring batch, saturating NVMe queue depth. Without it the writer falls
+back to synchronous `preadv`, limiting throughput.
+
 ```bash
 # --- Workload parameters (writer and reader MUST use the same values) ---
 VALUE_SIZE=4194304           # 4MB per key
@@ -129,6 +145,9 @@ NUM_KEYS=2048                # total keys
 # writer global_segment_size = VALUE_SIZE * NUM_KEYS (8GB) — large enough to hold all data
 SEGMENT_SIZE=$((VALUE_SIZE * NUM_KEYS))
 
+MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=8589934592  \
+MOONCAKE_OFFLOAD_USE_URING=true                       \
+MC_OFFLOAD_RPC_THREAD_NUM=16                          \
 stress_cluster_bench \
   --scenario=remote_disk \
   --role=writer \
@@ -151,6 +170,12 @@ stress_cluster_bench \
 
 - Writer uses host buffers only (`--gpu_mode` must be empty/`host`).
 - `</mnt/your-nvme>` must exist and be writable before launch.
+- `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`: FileStorage ClientBuffer size;
+  raise above the default (1.25 GiB) to avoid BUFFER_OVERFLOW under concurrency.
+- `MOONCAKE_OFFLOAD_USE_URING=true`: enable io_uring + O_DIRECT for SSD reads
+  (requires `-DUSE_URING=ON` at build time).
+- `MC_OFFLOAD_RPC_THREAD_NUM=16`: coro_rpc threads serving `batch_get_offload_object`
+  RPCs; increase from the default (8) to match reader thread count.
 
 ### Step 3 — reader (GPU node, after writer finished)
 

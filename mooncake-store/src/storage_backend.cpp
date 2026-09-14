@@ -2095,18 +2095,26 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         }
         auto& file = file_res.value();
 
-        // Read each key's data
-        for (const auto& plan : read_plans) {
-            int64_t actual_offset = plan.offset + plan.key_size;
-            tl::expected<size_t, ErrorCode> read_res;
-            const auto disk_start = std::chrono::steady_clock::now();
-            const char* io_mode = "preadv";
+        // Read each key's data. When the file is a UringFile (io_uring with
+        // O_DIRECT), all reads for this bucket are submitted as a single batch
+        // (NVMe queue depth > 1) before waiting for completions, then per-key
+        // pointers are adjusted for O_DIRECT alignment (no memcpy). The
+        // PosixFile fallback stays per-key.
+        tl::expected<size_t, ErrorCode> read_res;
+        const char* io_mode = "preadv";
 
 #ifdef USE_URING
-            // Try to use read_aligned for O_DIRECT I/O if file is UringFile
-            UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-            if (uring_file != nullptr) {
-                io_mode = "io_uring_direct";
+        UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+        if (uring_file != nullptr) {
+            io_mode = "io_uring_direct";
+            const auto disk_start = std::chrono::steady_clock::now();
+            std::vector<UringFile::ReadDesc> descs;
+            std::vector<size_t> offset_in_buffers;
+            descs.reserve(read_plans.size());
+            offset_in_buffers.reserve(read_plans.size());
+            size_t expected_total = 0;
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
                 // Calculate aligned read range
                 int64_t aligned_offset =
                     align_down(actual_offset, kDirectIOAlignment);
@@ -2116,35 +2124,42 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     static_cast<size_t>(data_end), kDirectIOAlignment));
                 size_t aligned_size =
                     static_cast<size_t>(aligned_end - aligned_offset);
-                int64_t offset_in_buffer = actual_offset - aligned_offset;
-
-                // Zero-copy path: read directly into the slice buffer.
-                // dest_slice.ptr is 4096-aligned and oversized (from
-                // AllocateBatch) to accommodate the full aligned read range.
-                SpDiag::PerfPoint pt_uring(PerfKey::GET_SSD_OWNER_LOAD_URING,
-                                           SpDiag::PerfLevel::MODULE);
-                pt_uring.Start();
-                read_res = uring_file->read_aligned(
-                    plan.dest_slice.ptr, aligned_size, aligned_offset);
-                pt_uring.End(read_res ? 0 : -1);
-
-                if (read_res) {
-                    // Adjust ptr to point to actual data start (no memcpy)
-                    batch_object.at(plan.key).ptr =
-                        static_cast<char*>(plan.dest_slice.ptr) +
-                        offset_in_buffer;
-                    read_res = plan.dest_slice.size;
-                }
-            } else
-#endif
-        {
-            // Fallback to per-key vector_read for non-UringFile (PosixFile).
-            iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-            SpDiag::PerfPoint pt_posix(PerfKey::GET_SSD_OWNER_LOAD_POSIX,
+                size_t offset_in_buffer =
+                    static_cast<size_t>(actual_offset - aligned_offset);
+                // Zero-copy: dest_slice.ptr is 4096-aligned and oversized
+                // (from AllocateBatch) to accommodate the aligned read range.
+                descs.push_back(UringFile::ReadDesc{
+                    plan.dest_slice.ptr, aligned_size,
+                    static_cast<off_t>(aligned_offset)});
+                offset_in_buffers.push_back(offset_in_buffer);
+                expected_total += aligned_size;
+            }
+            SpDiag::PerfPoint pt_uring(PerfKey::GET_SSD_OWNER_LOAD_URING,
                                        SpDiag::PerfLevel::MODULE);
-            pt_posix.Start();
-            read_res = file->vector_read(&iov, 1, actual_offset);
-            pt_posix.End(read_res ? 0 : -1);
+            pt_uring.Start();
+            read_res = uring_file->batch_read(
+                descs.data(), static_cast<int>(descs.size()));
+            pt_uring.End(read_res ? 0 : -1);
+            if (read_res && read_res.value() != expected_total) {
+                if (stats) {
+                    stats->status = "short_read";
+                    stats->error_key =
+                        read_plans.empty() ? "" : read_plans[0].key;
+                    stats->error_code = ErrorCode::FILE_READ_FAIL;
+                }
+                LOG(ERROR) << "batch_read size mismatch for bucket_id="
+                           << bucket_id << ", expected: " << expected_total
+                           << ", got: " << read_res.value();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            if (read_res) {
+                // Adjust each key's ptr to point to actual data start.
+                for (size_t i = 0; i < read_plans.size(); ++i) {
+                    batch_object.at(read_plans[i].key).ptr =
+                        static_cast<char*>(read_plans[i].dest_slice.ptr) +
+                        offset_in_buffers[i];
+                }
+            }
             if (stats) {
                 const auto read_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2153,7 +2168,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 stats->disk_read_us += read_us;
                 if (read_us > stats->slowest_disk_read_us) {
                     stats->slowest_disk_read_us = read_us;
-                    stats->slowest_key = plan.key;
+                    stats->slowest_key =
+                        read_plans.empty() ? "" : read_plans[0].key;
                 }
                 if (stats->io_mode == "unknown") {
                     stats->io_mode = io_mode;
@@ -2161,31 +2177,60 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     stats->io_mode = "mixed";
                 }
             }
-
-            if (!read_res) {
+        } else
+#endif
+        {
+            // Fallback to per-key vector_read for non-UringFile (PosixFile).
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
+                const auto disk_start = std::chrono::steady_clock::now();
+                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+                SpDiag::PerfPoint pt_posix(PerfKey::GET_SSD_OWNER_LOAD_POSIX,
+                                           SpDiag::PerfLevel::MODULE);
+                pt_posix.Start();
+                read_res = file->vector_read(&iov, 1, actual_offset);
+                pt_posix.End(read_res ? 0 : -1);
                 if (stats) {
-                    stats->status = "read_fail";
-                    stats->error_key = plan.key;
-                    stats->error_code = read_res.error();
+                    const auto read_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - disk_start)
+                            .count();
+                    stats->disk_read_us += read_us;
+                    if (read_us > stats->slowest_disk_read_us) {
+                        stats->slowest_disk_read_us = read_us;
+                        stats->slowest_key = plan.key;
+                    }
+                    if (stats->io_mode == "unknown") {
+                        stats->io_mode = io_mode;
+                    } else if (stats->io_mode != io_mode) {
+                        stats->io_mode = "mixed";
+                    }
                 }
-                LOG(ERROR) << "vector_read failed for key: " << plan.key
-                           << ", bucket_id=" << plan.bucket_id
-                           << ", error: " << read_res.error();
-                return tl::make_unexpected(read_res.error());
-            }
 
-            if (read_res.value() != plan.dest_slice.size) {
-                if (stats) {
-                    stats->status = "short_read";
-                    stats->error_key = plan.key;
-                    stats->error_code = ErrorCode::FILE_READ_FAIL;
+                if (!read_res) {
+                    if (stats) {
+                        stats->status = "read_fail";
+                        stats->error_key = plan.key;
+                        stats->error_code = read_res.error();
+                    }
+                    LOG(ERROR) << "vector_read failed for key: " << plan.key
+                               << ", bucket_id=" << plan.bucket_id
+                               << ", error: " << read_res.error();
+                    return tl::make_unexpected(read_res.error());
                 }
-                LOG(ERROR) << "Read size mismatch for key: " << plan.key
-                           << ", expected: " << plan.dest_slice.size
-                           << ", got: " << read_res.value();
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+
+                if (read_res.value() != plan.dest_slice.size) {
+                    if (stats) {
+                        stats->status = "short_read";
+                        stats->error_key = plan.key;
+                        stats->error_code = ErrorCode::FILE_READ_FAIL;
+                    }
+                    LOG(ERROR) << "Read size mismatch for key: " << plan.key
+                               << ", expected: " << plan.dest_slice.size
+                               << ", got: " << read_res.value();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
             }
-        }
         }
     }
 
