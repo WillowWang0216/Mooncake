@@ -2112,7 +2112,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             std::vector<size_t> offset_in_buffers;
             descs.reserve(read_plans.size());
             offset_in_buffers.reserve(read_plans.size());
-            size_t expected_total = 0;
             for (const auto& plan : read_plans) {
                 int64_t actual_offset = plan.offset + plan.key_size;
                 // Calculate aligned read range
@@ -2132,7 +2131,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     plan.dest_slice.ptr, aligned_size,
                     static_cast<off_t>(aligned_offset)});
                 offset_in_buffers.push_back(offset_in_buffer);
-                expected_total += aligned_size;
             }
             SpDiag::PerfPoint pt_uring(PerfKey::GET_SSD_OWNER_LOAD_URING,
                                        SpDiag::PerfLevel::MODULE);
@@ -2140,25 +2138,25 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             read_res = uring_file->batch_read(
                 descs.data(), static_cast<int>(descs.size()));
             pt_uring.End(read_res ? 0 : -1);
-            if (read_res && read_res.value() != expected_total) {
+            if (!read_res) {
                 if (stats) {
-                    stats->status = "short_read";
+                    stats->status = "read_fail";
                     stats->error_key =
                         read_plans.empty() ? "" : read_plans[0].key;
-                    stats->error_code = ErrorCode::FILE_READ_FAIL;
+                    stats->error_code = read_res.error();
                 }
-                LOG(ERROR) << "batch_read size mismatch for bucket_id="
-                           << bucket_id << ", expected: " << expected_total
-                           << ", got: " << read_res.value();
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                LOG(ERROR) << "batch_read failed for bucket_id=" << bucket_id
+                           << ", error: " << read_res.error();
+                return tl::make_unexpected(read_res.error());
             }
-            if (read_res) {
-                // Adjust each key's ptr to point to actual data start.
-                for (size_t i = 0; i < read_plans.size(); ++i) {
-                    batch_object.at(read_plans[i].key).ptr =
-                        static_cast<char*>(read_plans[i].dest_slice.ptr) +
-                        offset_in_buffers[i];
-                }
+            // Adjust each key's ptr to point to actual data start. The
+            // aligned read may return fewer bytes than aligned_size when
+            // the alignment padding extends past the file end (O_DIRECT
+            // short-read); the actual data range is unaffected.
+            for (size_t i = 0; i < read_plans.size(); ++i) {
+                batch_object.at(read_plans[i].key).ptr =
+                    static_cast<char*>(read_plans[i].dest_slice.ptr) +
+                    offset_in_buffers[i];
             }
             if (stats) {
                 const auto read_us =
